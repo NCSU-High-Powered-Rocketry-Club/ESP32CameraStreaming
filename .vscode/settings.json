@@ -1,0 +1,30 @@
+{
+    // Path to the clangd language server binary.
+    // NOTE: this only works with a NATIVE (non-Flatpak) VSCodium — a Flatpak
+    // sandbox cannot execute host /usr/bin binaries. After switching to the
+    // native install and `sudo pacman -S clang`, clangd lives at /usr/bin/clangd.
+    "clangd.path": "/usr/bin/clangd",
+    "clangd.arguments": [
+        "--background-index",
+        "--log=error",
+        // Let clangd query the actual PlatformIO GCC toolchains so it can follow
+        // compiler-builtin macros/headers instead of erroring on -march/-fno-* flags.
+        "--query-driver=/home/willi/.platformio/packages/toolchain-*/bin/*"
+    ],
+    // The vscode-clangd extension must see this workspace's compile database.
+    // Re-generate it per board with:   pio run -t compiledb -e <env>
+    "clangd.fallbackFlags": [
+        "-std=gnu++11",
+        "-I${workspaceFolder}/src"
+    ],
+    // PlatformIO generates c_cpp_properties.json; keep it out of the way of clangd.
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "cph.clangdCompileCommands": "${workspaceFolder}/compile_commands.json",
+    "search.exclude": {
+        "**/.pio": true,
+        "**/lib/pioasm": true
+    },
+    "files.watcherExclude": {
+        "**/.pio/**": true
+    }
+}

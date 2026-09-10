@@ -1,0 +1,17 @@
+{
+    // Receiver sub-project (ESP32-C3). Its OWN compile database must be used —
+    // the root project's compile_commands.json is for the S3 sender board and
+    // has the wrong SDK/include flags for these C3 files.
+    // Generate it with:   cd receiver && pio run -t compiledb -e esp32c3_receiver
+    "clangd.arguments": [
+        "--background-index",
+        "--log=error",
+        "--query-driver=/home/willi/.platformio/packages/toolchain-*/bin/*"
+    ],
+    "clangd.fallbackFlags": [
+        "-std=gnu++11",
+        "-I${workspaceFolder}/src"
+    ],
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "cph.clangdCompileCommands": "${workspaceFolder}/compile_commands.json"
+}
