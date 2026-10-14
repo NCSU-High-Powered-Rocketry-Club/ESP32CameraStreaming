@@ -27,6 +27,13 @@
 //     receive/reassemble loop - if the USB buffer is full we drop/skip frames.
 // Hardware UART (Serial0 = GPIO21 TX): mirrors diagnostics in every mode.
 //     m = print MAC, s = status, g = start USB stream, x = stop USB stream
+// Dashboard controls relayed to the S3 over ESP-NOW (accepted on both ports,
+// also used by host/c3_usb_mjpeg.py):
+//     0/1/2 = quality preset, M = toggle sender mic,
+//     r / e = start / stop the microSD recording on the S3,
+//     t<secs> = max recording length (t0 = until stopped),
+//     p<0..2> = recording/streaming priority (0 = SD first, 1 = balanced,
+//               2 = stream first)
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -122,7 +129,46 @@ static uint32_t crc32(const uint8_t* data, size_t len) {
   return c ^ 0xFFFFFFFFu;
 }
 
+// ---------------------------------------------------------------------------
+// Recording-status lines from the S3. onRecv() runs in the WiFi task, and
+// writing console text to USB from there could land INSIDE a half-delivered
+// JPEG frame and corrupt the host's stream. So onRecv only queues the line and
+// loop() flushes it once the USB pump is idle (outState == 0) - the same
+// guarantee the pump itself relies on. The hardware UART gets it immediately.
+// ---------------------------------------------------------------------------
+static char             recLineBuf[128];
+static volatile bool    recLinePending = false;
+static portMUX_TYPE     recLineMux = portMUX_INITIALIZER_UNLOCKED;
+
 void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
+  // Recording status from the S3 ({'S', on, sd, prio, frames(2BE), left(2BE),
+  // idx(2BE)}). Not a video/audio payload - surface it as a console line that
+  // the host viewer displays (and parses) on the dashboard.
+  if (len >= 10 && data[0] == REC_STATUS_TAG) {
+    const bool on   = (data[1] == '1');
+    const bool sd   = (data[2] == '1');
+    const uint16_t frames = (uint16_t)((data[4] << 8) | data[5]);
+    const uint16_t left   = (uint16_t)((data[6] << 8) | data[7]);
+    const uint16_t idx    = (uint16_t)((data[8] << 8) | data[9]);
+    char leftTxt[16];
+    if (!on)                   snprintf(leftTxt, sizeof(leftTxt), "-");
+    else if (left == 0xFFFF)   snprintf(leftTxt, sizeof(leftTxt), "unlimited");
+    else                       snprintf(leftTxt, sizeof(leftTxt), "%us", (unsigned)left);
+    char line[128];
+    snprintf(line, sizeof(line),
+             "[rx] REC state=%s idx=%u frames=%u left=%s prio=%c sd=%u\n",
+             on ? "on" : "off", (unsigned)idx, (unsigned)frames, leftTxt,
+             (char)data[3], (unsigned)(sd ? 1 : 0));
+    Serial0.print(line);                  // hw UART: immediately, always
+    if (!recLinePending) {                // queue exactly one for the USB host
+      portENTER_CRITICAL(&recLineMux);
+      memcpy(recLineBuf, line, sizeof(recLineBuf));
+      recLinePending = true;
+      portEXIT_CRITICAL(&recLineMux);
+    }
+    return;
+  }
+
   // Audio datagrams: [0xA3 0xA5][seq:2BE] + PCM. Never touch video state.
   if (len > 4 && data[0] == (AUDIO_AIR_MAGIC >> 8) &&
       data[1] == (AUDIO_AIR_MAGIC & 0xFF)) {
@@ -313,6 +359,77 @@ static void pumpUsbAudio() {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard control relay.
+// 'Q'/'R'/'T'/'P' are idempotent "set" commands, so they are re-sent a few
+// times: ESP-NOW broadcasts are not ACKed and one lost datagram = one dead
+// button press. 'M' is a TOGGLE and must never be repeated (an even number of
+// deliveries would cancel itself out), so it is sent exactly once.
+// ---------------------------------------------------------------------------
+static void relayToSender(const uint8_t* cmd, size_t len, const char* label) {
+  int sent = 0;
+  for (int i = 0; i < 3; ++i) {
+    if (esp_now_send(BCAST_MAC, cmd, len) == ESP_OK) sent++;
+    delay(2);
+  }
+  char line[64];
+  snprintf(line, sizeof(line), "[rx] %s -> S3 (%d/3 sent)\n", label, sent);
+  Serial0.print(line);
+  if (!usbStreaming) Serial.print(line);
+}
+
+// Read the decimal argument that follows a command char: the dashboard sends
+// "t30" / "p2", and a human types the same in `pio device monitor`. Returns -1
+// when no digit arrives inside the window. Once the FIRST digit is in, it only
+// waits ~20 ms for the rest, so a relayed "t30" costs the streaming loop a few
+// milliseconds instead of the full window.
+static int readDecArg(int maxDigits) {
+  int v = -1;
+  uint32_t t0 = millis();
+  uint32_t idleFrom = 0;
+  while (millis() - t0 < 300) {
+    int c = -1;
+    if (Serial.available())        c = Serial.read();
+    else if (Serial0.available())  c = Serial0.read();
+    if (c < 0) {
+      if (v >= 0) {                       // digits seen: wait briefly for more
+        if (!idleFrom) idleFrom = millis();
+        else if (millis() - idleFrom > 20) break;
+      }
+      delay(2);
+      continue;
+    }
+    idleFrom = 0;
+    if (c < '0' || c > '9') break;
+    v = (v < 0 ? 0 : v) * 10 + (c - '0');
+    if (--maxDigits <= 0) break;
+  }
+  return v;
+}
+
+// Flush a queued "[rx] REC ..." line to the USB host. In console mode it goes
+// out immediately; in stream mode it waits until the pump is BETWEEN frames
+// (outState == 0) so console text can never land inside a JPEG delivery - the
+// host's parser would resync anyway, but there is no reason to inject noise.
+// If the host's write buffer is full the line is dropped: another status
+// report follows within RECORD_STATUS_PERIOD_MS (2 s on the sender).
+static void flushRecStatusLine() {
+  if (!recLinePending) return;
+  if (usbStreaming && outState != 0) return;
+
+  char buf[sizeof(recLineBuf)];
+  portENTER_CRITICAL(&recLineMux);
+  memcpy(buf, recLineBuf, sizeof(buf));
+  recLinePending = false;
+  portEXIT_CRITICAL(&recLineMux);
+  buf[sizeof(buf) - 1] = '\0';
+
+  if (!Serial) return;                                  // no USB host attached
+  size_t len = strlen(buf);
+  if ((size_t)Serial.availableForWrite() < len) return;  // host busy - skip
+  Serial.print(buf);
+}
+
+// ---------------------------------------------------------------------------
 // Commands (accepted on BOTH ports). 'g'/'x' switch the USB CDC between the
 // readable console (pio monitor: banner, logs, m/s) and the binary frame
 // stream that host/c3_usb_mjpeg.py consumes. 'm'/'s' always answer on the
@@ -327,20 +444,52 @@ static void handleCommand(char ch) {
     Serial0.println("[rx] USB CDC -> STREAM mode (binary frames to host)");
   } else if (ch == '0' || ch == '1' || ch == '2') {
     // Quality control from the dashboard: relay as an ESP-NOW broadcast to
-    // the S3 sender ('Q' + level). Cheap 2-byte datagram, sent a few times
-    // for robustness (broadcasts are not ACKed).
+    // the S3 sender ('Q' + level).
     uint8_t cmd[2] = { (uint8_t)'Q', (uint8_t)ch };
-    esp_err_t e = esp_now_send(BCAST_MAC, cmd, sizeof(cmd));
-    Serial0.printf("[rx] quality %c -> S3 (%s)\n", ch,
-                   e == ESP_OK ? "sent" : "SEND FAILED");
-    if (!usbStreaming)
-      Serial.printf("[rx] quality %c -> S3 (%s)\n", ch,
-                    e == ESP_OK ? "sent" : "SEND FAILED");
+    char label[32];
+    snprintf(label, sizeof(label), "quality %c", ch);
+    relayToSender(cmd, sizeof(cmd), label);
+  } else if (ch == 'r' || ch == 'e') {
+    // Dashboard: start ('r') / stop ('e') the microSD recording on the S3.
+    uint8_t cmd[2] = { (uint8_t)REC_CTRL_TAG_R, (uint8_t)(ch == 'r' ? '1' : '0') };
+    relayToSender(cmd, sizeof(cmd), ch == 'r' ? "rec start" : "rec stop");
+  } else if (ch == 't') {
+    // Dashboard: maximum recording length in seconds ("t30"; t0 = until
+    // stopped). 5 digits max -> up to 99999, clamped by the sender.
+    int secs = readDecArg(5);
+    if (secs < 0) {
+      Serial0.println("[rx] usage: t<seconds>   (t0 = record until stopped)");
+      if (!usbStreaming) Serial.println("[rx] usage: t<seconds>");
+    } else {
+      uint8_t cmd[3] = { (uint8_t)REC_CTRL_TAG_T,
+                         (uint8_t)((uint16_t)secs >> 8),
+                         (uint8_t)((uint16_t)secs & 0xFF) };
+      char label[40];
+      snprintf(label, sizeof(label), "rec max %ds", secs);
+      relayToSender(cmd, sizeof(cmd), label);
+    }
+  } else if (ch == 'p') {
+    // Dashboard: recording/streaming priority (0 = SD first, 1 = balanced,
+    // 2 = stream first).
+    int prio = readDecArg(1);
+    if (prio < 0 || prio > 2) {
+      Serial0.println("[rx] usage: p<0..2>   (0 = SD first, 1 = balanced, 2 = stream first)");
+      if (!usbStreaming) Serial.println("[rx] usage: p<0..2>");
+    } else {
+      uint8_t cmd[2] = { (uint8_t)REC_CTRL_TAG_P, (uint8_t)('0' + prio) };
+      char label[40];
+      snprintf(label, sizeof(label), "rec priority %d", prio);
+      relayToSender(cmd, sizeof(cmd), label);
+    }
   } else if (ch == 'M') {                // dashboard: toggle sender microphone
+    // Toggle: sent ONCE (see the note at relayToSender).
     uint8_t cmd = (uint8_t)'M';
     esp_err_t e = esp_now_send(BCAST_MAC, &cmd, 1);
     Serial0.printf("[rx] mic toggle -> S3 (%s)\n",
                    e == ESP_OK ? "sent" : "SEND FAILED");
+    if (!usbStreaming)
+      Serial.printf("[rx] mic toggle -> S3 (%s)\n",
+                    e == ESP_OK ? "sent" : "SEND FAILED");
   } else if (ch == 'x') {                // host closing / manual stop
     usbStreaming = false;
     outState = 0;
@@ -381,7 +530,9 @@ static bool usbConnected = false;
 static void consoleHello() {
   uint8_t d[6]; WiFi.macAddress(d);
   const char* line1 = "\n[rx] ESP32-C3 dish receiver | WiFi '%s' | MAC %02X:%02X:%02X:%02X:%02X:%02X\n";
-  const char* line2 = "[rx] console: m = MAC, s = status, g = start USB stream, x = stop\n";
+  const char* line2 = "[rx] console: m = MAC, s = status, g = start USB stream, x = stop\n"
+                      "[rx] ctrl: 0/1/2 quality, r/e rec start/stop, t<secs> max length, "
+                      "p<0..2> priority, M mic\n";
   Serial0.printf(line1, WIFI_SSID, d[0],d[1],d[2],d[3],d[4],d[5]);
   Serial0.print(line2);
   Serial.printf(line1, WIFI_SSID, d[0],d[1],d[2],d[3],d[4],d[5]);  // no-op if no host
@@ -486,6 +637,7 @@ void loop() {
 
   pumpUsb();
   pumpUsbAudio();
+  flushRecStatusLine();
   handleSerialInput();
 
   // Streaming but the air side is silent? Tell the user where to look. Safe

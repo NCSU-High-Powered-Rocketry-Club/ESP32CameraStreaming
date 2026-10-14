@@ -22,6 +22,7 @@ single flag. The project uses **PlatformIO + arduino-esp32 core 2.0.17**
 │   ├── camera_pins.h       #   XIAO S3 Sense GPIO->camera pin map (verified)
 │   ├── camera_hal.cpp/.h   #   capture, quality profiles, adaptive engine, cameraReinit
 │   ├── camera_debug.cpp/.h #   gated boot + camera diagnostics (DEBUG_CAMERA)
+│   ├── recorder.cpp/.h     #   microSD MJPEG (.avi) recorder + priority policy
 │   ├── stream_browser.cpp/.h   # HTTP MJPEG target (phone/PC browser)
 │   └── stream_espnow.cpp/.h    # segmented ESP-NOW target (C3 dish)
 ├── receiver/               # receiver "dish" side ===== (NESTED sub-project)
@@ -29,8 +30,9 @@ single flag. The project uses **PlatformIO + arduino-esp32 core 2.0.17**
 │   └── src/
 │       ├── receiver.cpp          #   ESP-NOW receive + reassemble -> USB CDC forward
 │       └── receiver_config.h
-└── host/                   # host viewer ===== (stdlib-only Python, no deps)
-    └── c3_usb_mjpeg.py     #   opens C3 USB CDC, CRC-validates, MJPEG at :8080
+├── host/                   # host viewer ===== (stdlib-only Python, no deps)
+│   └── c3_usb_mjpeg.py     #   opens C3 USB CDC, CRC-validates, MJPEG at :8080
+│                           #   + dashboard controls (quality/mic/SD recording)
 ```
 
 **Important structure note:** PlatformIO does **not** support per-environment
@@ -229,8 +231,9 @@ the C3; host is stdlib only; framing constants synced both ways.
 
 | Target | Status |
 |--------|--------|
-| `STREAM_TARGET_BROWSER` | Working. MJPEG over AP Web, non-blocking, quality live-switchable. |
+| `STREAM_TARGET_BROWSER` | Working. MJPEG over AP Web, non-blocking, quality live-switchable. Unchanged by section 11 (no recorder in this build). |
 | `STREAM_TARGET_ESP32C3` | Working (FW). C3 reassembles ESP-NOW and forwards framed JPEG over USB CDC to `host/c3_usb_mjpeg.py`, which re-serves MJPEG at :8080. Needs hardware to confirm live pixels. |
+| `STREAM_TARGET_ESP32C3` + `ENABLE_SD_RECORDING` | Working (FW + host). Records the same frames to microSD as `.avi`, controlled from the dashboard; SD-vs-stream priority selectable. Built-in tests pass (section 11 §verification); the air control/status link and the real card still need hardware. |
 
 `STREAM_TARGET` is currently `BROWSER` (unchanged).
   (clangd) and `.vscode/` artifacts that are also ignored.
@@ -271,3 +274,98 @@ tell the two apart, and is fully compiled out at `0` (no size/speed/noise cost).
   driver's de-init noise and are harmless.
 - Builds verified clean (zero warnings) for `STREAM_TARGET` = BROWSER and
   ESP32C3, and for `DEBUG_CAMERA` = 0, 1 and 2.
+
+## 11. microSD recording merged in (from the standalone `camera.zip` sketch)
+
+**What was merged.** `camera.zip` was a standalone XIAO ESP32S3-Sense **AVI
+recorder** sketch (SD mount + Motion-JPEG `.avi` container writer + serial menu).
+It is now `src/recorder.cpp/.h` in this repo's sender: SD mount (CS=GPIO21,
+SPI 7/8/9, 20 MHz with a 4 MHz retry), the AVI writer (`RIFF`/`hdrl`/`movi`/`idx1`),
+the EOI frame trim (`recorderJpegLength()`), the clip report, and the settings
+(`max seconds`, `priority`). The zip's own project files were **not** copied in:
+the ESP-NOW sender already owns the camera, so the recorder is a module its
+streaming loop feeds, not a second project.
+
+**Scope rule (important).** The recorder is wired into the **ESP-NOW
+(`STREAM_TARGET_ESP32C3`) path only**. `src/config.h` `#undef`s
+`ENABLE_SD_RECORDING` to 0 for the browser/phone target, so that build contains
+no SD code, never mounts the card and has no recorder commands.
+Measured cost: browser build 761,545 B → **761,569 B** (+24 B, the shared EOI
+trim helper inside the always-compiled `stream_espnow.cpp`); ESP-NOW build
+**849,777 B**. Both build with zero warnings.
+
+**One capture, two consumers** (`stream_espnow.cpp` → `espnowPoll()`). Each pass
+captures one frame and hands that same JPEG (trimmed once, used by both) to the
+SD writer and/or the air link. Whose timing is protected when one frame slot
+(`1000/max_fps` ms) cannot afford both is `RECORD_PRIORITY_*`:
+
+| Priority | Behaviour |
+|----------|-----------|
+| `SD` (0) | card first; if the write ate the slot the frame is NOT streamed |
+| `BALANCED` (1, default) | always both (card first, then air); loop rate absorbs it |
+| `STREAM` (2) | air first; if the send ate the slot the frame is NOT written |
+
+A frame too large for the C3 (`RECEIVER_MAX_FRAME_BYTES`) is still recorded under
+SD/balanced (valid picture) and only skipped on the air, which also triggers the
+existing auto-downscale.
+
+**Control / status protocol** (all tiny, lossy, one-way per direction; tags
+documented in `src/config.h` §5b and `receiver/src/receiver_config.h`):
+
+| Direction | Payload | Meaning |
+|-----------|---------|---------|
+| C3 → S3 (broadcast) | `{'Q', lvl}` | quality preset (existing) |
+| C3 → S3 | `{'M'}` | mic toggle (existing, sent ONCE - not idempotent) |
+| C3 → S3 | `{'R', '0'/'1'}` | stop / start SD recording |
+| C3 → S3 | `{'T', secHi, secLo}` | max clip seconds (0 = until stopped) |
+| C3 → S3 | `{'P', '0'..'2'}` | SD/stream priority |
+| S3 → C3 (peer MAC) | `{'S', on, sd, prio, frames(2BE), left(2BE), idx(2BE)}` | recording status |
+
+The `R`/`T`/`P` relays are sent 3× (broadcasts are not ACKed) via
+`relayToSender()`; `M` stays single-shot. Start/stop requests only set a flag in
+`onRecv()` (WiFi task) and are serviced by `espnowPoll()` (loop task) - SD I/O
+must not run on the RF receive path. A start is serviced on the next captured
+frame because the AVI header needs the frame's real width/height.
+
+**Dashboard.** `host/c3_usb_mjpeg.py` gained an "SD recording" card: START REC /
+END REC, "END AFTER (seconds)" + SET, and SD/BALANCED/STREAM. Commands travel
+dashboard → `/ctl` → C3 serial (`r`, `e`, `t<secs>`, `p<0..2>`) → ESP-NOW → S3.
+`/ctl` now **validates** with `re.fullmatch` instead of filtering characters, so
+junk containing an `r` can no longer start a recording (it used to: the filter
+turned `"drop me!!r"` into `"rper"`).
+
+**Status back to the page.** S3 → C3 status datagram every
+`RECORD_STATUS_PERIOD_MS` (2 s) → the C3 prints
+`[rx] REC state=on idx=3 frames=142 left=17s prio=1 sd=1` → the page parses it
+with `REC_LINE_RE` and shows clip number, frames, seconds left, priority and
+card-present. Because `onRecv()` runs in the WiFi task, it only *queues* that
+line; `loop()` flushes it to USB only when the pump is between frames
+(`outState == 0`), so console text can never land inside a half-sent JPEG.
+
+**S3 serial keys** (dispatched from `main.cpp`, the only `Serial` reader, into
+`espnowHandleSerialKey()`): `r` start, `e` stop, `D<secs>` max length,
+`P<0..2>` priority, plus `q0/q1/q2`. `espnowHandleSerialQ()` and
+`browserHandleSerialQ()` are effectively dead code (`main.cpp` drains `Serial`
+first), which is exactly why the new keys are dispatched from `main.cpp`.
+
+**Verification actually run** (nothing below is assumed - all executed):
+
+1. `pio run` for the sender in **both** `STREAM_TARGET` values and for the
+   receiver: clean, zero warnings.
+2. `src/recorder.cpp` compiled **natively** (g++ against tiny Arduino/SD/SPI
+   stubs) and executed: mount, settings + clamping (3600 s cap, invalid
+   priority → default), EOI trimming of a padded frame, a 24-frame clip, a
+   second clip not overwriting the first, auto-stop at the length limit, an
+   unlimited clip surviving `recorderTick()`, status lines, and the
+   start/write/stop refusals. The `.avi` files it wrote were then checked with
+   `ffprobe` (mjpeg, correct width/height/rate, `nb_frames`) **and** by parsing
+   RIFF/`avih`/`strh`/`strf`/`movi`/`idx1` directly: header frame count and
+   `idx1` count == frames written, uniform trimmed chunk size, every chunk
+   starting `FF D8` and ending `FF D9`.
+3. `host/c3_usb_mjpeg.py` driven over real HTTP in-process: frame parser with
+   interleaved console text + audio + a corrupt header (resync), `/status` JSON,
+   every `/ctl` command forwarded verbatim, malformed commands rejected, and the
+   firmware `snprintf` format re-formatted and matched against `REC_LINE_RE`.
+4. **Still needs hardware** (no boards attached here): the ESP-NOW control/status
+   datagrams over the air, the real SD card (speed, FAT32, the J3 pad), the
+   dashboard buttons end-to-end, and the actual priority behaviour under load.

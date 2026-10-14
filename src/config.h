@@ -118,6 +118,22 @@
 #define ESPNOW_MAX_QUALITY  QUALITY_MEDIUM
 
 // ---------------------------------------------------------------------------
+// 5b) Control / status back-channel (ESP-NOW, tiny tagged datagrams)
+//     Control  (C3 -> S3, broadcast, MUST match the tags in
+//               receiver/src/receiver.cpp - keep both sides in sync):
+//       {'Q', level}                 quality 0..2  ('0'..'2')
+//       {'M'}                        toggle the PDM mic
+//       {'R', '0'|'1'}               stop / start the SD recording   <- new
+//       {'T', secHi, secLo}          max recording seconds (0 = unlimited) <- new
+//       {'P', '0'..'2'}              recording/streaming priority   <- new
+//     Status   (S3 -> C3, sent to the peer MAC, printed by the C3 as an
+//               "[rx] REC ..." line that host/c3_usb_mjpeg.py shows and parses):
+//       {'S', on, sd, prio, frames(2BE), left(2BE), idx(2BE)}
+//     Both are lossy fire-and-forget; a lost control datagram is re-sent by
+//     pressing the button again, and a lost status line is simply not shown.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // 6) Microphone (PDM mic on the XIAO S3 Sense expansion board)
 //    16 kHz captured, decimated to 8 kHz, 8-bit unsigned PCM = 8 KB/s, which
 //    fits in the spare ESP-NOW airtime next to the video segments.
@@ -132,7 +148,66 @@
 #define MIC_CHUNK_BYTES        240        // one ESP-NOW audio datagram = 30 ms
 
 // ---------------------------------------------------------------------------
-// 7) DEBUG FLAG - bring-up / camera diagnostics
+// 7) microSD recorder (ESP-NOW / "dish" target ONLY)
+// ---------------------------------------------------------------------------
+// The S3 records the very same JPEG frames it streams to the C3 onto the Sense
+// board's microSD slot, as a real .avi (Motion-JPEG) clip - so the footage
+// survives a link failure and can be pulled off the card afterwards. It is
+// wired into the ESP-NOW streaming path ONLY: with STREAM_TARGET_BROWSER this
+// section is inert (nothing mounts the card, no recorder commands exist).
+//
+//   0 = recorder compiled out of the loop (no mount, no commands)
+#define ENABLE_SD_RECORDING    1
+
+// ...but the recorder belongs to the ESP-NOW path ONLY: for the phone/browser
+// target the flag is forced to 0 here, so that build contains no SD code, never
+// mounts the card and has no recorder commands (the phone path is untouched).
+#if (STREAM_TARGET != STREAM_TARGET_ESP32C3)
+  #undef  ENABLE_SD_RECORDING
+  #define ENABLE_SD_RECORDING  0
+#endif
+
+// microSD slot on the Sense expansion board: SPI SCK=GPIO7, MISO=GPIO8,
+// MOSI=GPIO9 (the arduino-esp32 variant defaults) plus this chip-select.
+// Mount is retried at 4 MHz if the high speed fails.
+#define SD_CS_PIN              21
+#define SD_SPI_FREQUENCY       20000000
+
+// Clips are written to the card root as /video00001.avi, /video00002.avi, ...
+#define RECORD_FILE_PREFIX     "/video"
+#define RECORD_FILE_EXTENSION  ".avi"
+
+// Nominal frame rate written into the AVI container header. The real rate is
+// whatever the capture + air + SD path manages; players only use this for
+// seeking. (The dashboard's frame-rate expectation is the quality preset.)
+#define RECORD_AVI_FPS         15
+
+// Default clip length, in seconds, used until the dashboard sets another one.
+//   0 = record until STOP is pressed.
+#define RECORD_MAX_SECONDS     30
+
+// Priority arbitration between the SD writer and the ESP-NOW streamer for the
+// one captured frame they both want (see stream_espnow.cpp for the code):
+//   RECORD_PRIORITY_SD       -> card first. If the write eats the whole frame
+//                               slot the frame is NOT streamed, so the clip
+//                               keeps its frame rate and the stream degrades.
+//   RECORD_PRIORITY_BALANCED -> both always get the frame (card first, then the
+//                               air); the loop rate simply adapts to the sum of
+//                               the two costs.
+//   RECORD_PRIORITY_STREAM   -> air first. If the send owns the slot the frame
+//                               is NOT written, so the stream keeps its rate
+//                               and the clip's real fps drops instead.
+#define RECORD_PRIORITY_SD        0
+#define RECORD_PRIORITY_BALANCED  1
+#define RECORD_PRIORITY_STREAM    2
+#define RECORD_PRIORITY_DEFAULT   RECORD_PRIORITY_BALANCED
+
+// How often the sender reports its recording state to the C3 (the dashboard
+// shows it live). One tiny 10-byte datagram; 0 disables the reports.
+#define RECORD_STATUS_PERIOD_MS   2000
+
+// ---------------------------------------------------------------------------
+// 8) DEBUG FLAG - bring-up / camera diagnostics
 // ---------------------------------------------------------------------------
 // <-- FLIP THIS when a camera (or the whole board) looks dead. It is the switch
 //     that turns a silent black stream into a readable diagnosis on Serial.

@@ -28,6 +28,7 @@ S3 (airborne) --ESP-NOW--> C3 dish --USB CDC (wired)--> host (Pi/laptop)
 │   ├── camera_pins.h       #   XIAO S3 Sense GPIO->camera pin map (verified)
 │   ├── camera_hal.cpp/.h   #   capture, quality profiles, adaptive engine
 │   ├── camera_debug.cpp/.h #   gated boot + camera diagnostics (DEBUG_CAMERA)
+│   ├── recorder.cpp/.h     #   microSD MJPEG (.avi) recorder (ESP-NOW target only)
 │   ├── stream_browser.cpp/.h   # HTTP MJPEG target (phone/browser)
 │   └── stream_espnow.cpp/.h    # segmented ESP-NOW target (C3)
 ├── receiver/               # ======== "dish" side ========  (separate nested project)
@@ -37,7 +38,8 @@ S3 (airborne) --ESP-NOW--> C3 dish --USB CDC (wired)--> host (Pi/laptop)
 │       └── receiver_config.h
 └── host/                   # ======== host viewer ========  (stdlib-only Python)
     └── c3_usb_mjpeg.py     #   opens the C3 USB CDC port, CRC-validates,
-                            #   re-serves MJPEG at http://<host>:8080/
+                            #   re-serves MJPEG at http://<host>:8080/ and has
+                            #   the dashboard controls (quality, mic, SD recording)
 ```
 
 > The receiver is a **separate nested sub-project** because PlatformIO has no
@@ -128,6 +130,10 @@ log text is then mirrored to the hardware UART so it can't corrupt the JPEG
 stream), and sends `x` on exit — or you can just close the monitor — which
 hands the readable console back.
 
+The same page also drives the **sender's microSD recorder** (`r` / `e` / `t<secs>`
+/ `p<0..2>`, relayed to the S3 over ESP-NOW) and shows the recording state the S3
+reports back — see **section 4**.
+
 > Tune the ESP‑NOW link with the dish: point the high‑gain element at the S3's
 > antenna. Range, orientation and the 2.4 GHz environment dominate throughput.
 
@@ -164,7 +170,97 @@ Set the boot default with `QUALITY_DEFAULT` in `config.h`. Change at runtime:
 - ESP-NOW mode (automatic): an adaptive controller steps quality DOWN on a lossy
   link and steps back UP when it recovers (`ADAPTIVE_*` knobs in `config.h`).
 
-## 4) Optimization & error tolerance
+## 4) Recording to microSD (ESP-NOW / dish target only)
+
+The S3 can record the **same** JPEG frames it streams to the dish onto the Sense
+board's microSD slot, as a real `.avi` (Motion-JPEG) clip — so the footage
+survives a link failure and can be pulled off the card afterwards. One capture
+feeds both consumers, so recording costs no extra camera time.
+
+> **ESP-NOW build only.** Set `STREAM_TARGET` to `STREAM_TARGET_ESP32C3` in
+> `src/config.h` and leave `ENABLE_SD_RECORDING` at 1. With the phone/browser
+> target the recorder is compiled out entirely (`config.h` forces the flag to 0):
+> no SD mount, no recorder code, no controls.
+
+Hardware: the Sense expansion board's slot — SPI **SCK=GPIO7, MISO=GPIO8,
+MOSI=GPIO9** (arduino-esp32 defaults) + **CS=GPIO21**, card formatted **FAT32**.
+Mount is retried at 4 MHz when the high speed fails; a missing card only disables
+recording, the air link keeps running.
+
+### Dashboard controls (host page)
+
+`host/c3_usb_mjpeg.py` serves an **SD recording** card next to the quality/mic
+controls:
+
+| Control | Command sent | Path |
+|---------|--------------|------|
+| ⏺ START REC / ⏹ END REC | `r` / `e` | dashboard → C3 (USB) → ESP-NOW → S3 |
+| END AFTER (seconds) + SET | `t<secs>` (`t0` = record until stopped) | same |
+| SD / BALANCED / STREAM | `p0` / `p1` / `p2` | same |
+
+The card shows the sender's **real** state — clip number, frames written,
+seconds left, priority, card present — because the S3 reports it back over
+ESP-NOW and the C3 prints it as an `[rx] REC state=…` line, which the page
+parses. "no report yet - is the S3 running the ESP-NOW build?" means the sender
+is on the browser build (or off).
+
+### Priority between the SD card and the stream
+
+Both consumers want the same frame, and one frame slot is `1000 / max_fps` ms.
+`RECORD_PRIORITY_*` in `src/config.h` decides whose timing is protected:
+
+| Priority | When one slot cannot afford both |
+|----------|----------------------------------|
+| `SD` (0) | Write to the card first; if that eats the whole slot the frame is **not** streamed — the clip keeps its frame rate, the stream degrades |
+| `BALANCED` (1, default) | Always do both (card first, then the air); the loop rate absorbs the sum of the two costs |
+| `STREAM` (2) | Send over the air first; if the send owns the slot the frame is **not** written — the stream keeps its rate, the clip's real fps drops |
+
+A frame that is too big for the C3 (`RECEIVER_MAX_FRAME_BYTES`) is still written
+to the card under SD/balanced priority (it is a valid picture) and only skipped
+on the air — that path also triggers the usual auto-downscale.
+
+### Clips on the card
+
+`/video00001.avi`, `/video00002.avi`, … using the **first free index**, so clips
+from an earlier power cycle are never overwritten. Each file is a genuine AVI
+container (RIFF + `hdrl` + `movi` + `idx1` index), so seeking and playback work
+out of the box:
+
+```bash
+ffprobe /media/card/video00001.avi
+ffplay  /media/card/video00001.avi
+```
+
+Every frame is **trimmed at its JPEG EOI marker** (the OV3660 can return
+concatenated JPEGs or padding in one buffer), so each AVI frame *and* each
+streamed frame is a single self-contained image.
+
+### Serial control on the S3 console
+
+Handy when bench-testing the sender without the dashboard:
+
+```
+r               start recording          e               stop recording
+D<seconds>      max clip length (D0 = record until stopped)
+P<0..2>         priority (0 = SD first, 1 = balanced, 2 = stream first)
+s               status, incl. "REC state=... frames=... left=..."
+```
+
+Each clip also prints a report when it ends:
+
+```
+[rec] === saved /video00001.avi : 148 frames, 4720 KB, 10012 ms (14.8 fps) ===
+[rec]   frame size : avg 32.1 KB, min 28.9 KB, max 35.5 KB
+[rec]   SD cost    : 23.4 ms/frame, 471 KB/s written
+```
+
+`RECORD_MAX_SECONDS` (default 30 s) sets the clip length used until the dashboard
+changes it; `0` = record until STOP. A clip with a length also ends **by
+itself** once that many seconds have elapsed.
+
+---
+
+## 5) Optimization & error tolerance
 
 **Browser target**
 - Frames are captured straight into PSRAM with `CAMERA_GRAB_LATEST`, so a slow
@@ -195,11 +291,15 @@ Set the boot default with `QUALITY_DEFAULT` in `config.h`. Change at runtime:
   frames - it can never stall RF reception. There is no more Wi-Fi MJPEG on the
   C3 (that was the half-duplex contention this design removes).
 
-## 5) Config cheat-sheet
+## 6) Config cheat-sheet
 
 | Symbol | File | Meaning |
 |--------|------|---------|
 | `STREAM_TARGET` | `src/config.h` | **The flag**: `_BROWSER` or `_ESP32C3` |
+| `ENABLE_SD_RECORDING` | `src/config.h` | **microSD recorder** switch (forced 0 unless the target is ESP-NOW) |
+| `RECORD_PRIORITY_DEFAULT` | `src/config.h` | SD vs. stream priority (`SD` / `BALANCED` / `STREAM`) |
+| `RECORD_MAX_SECONDS` | `src/config.h` | Default clip length in seconds (0 = until stopped) |
+| `SD_CS_PIN` / `SD_SPI_FREQUENCY` | `src/config.h` | microSD slot wiring (CS=21; SCK/MISO/MOSI 7/8/9) |
 | `DEBUG_CAMERA` | `src/config.h` | **Debug flag**: 0=off, 1=boot+self-test, 2=+per-frame ('d' dumps live) |
 | `CAMERA_XCLK_HZ` / `CAMERA_FB_LOCATION` | `src/config.h` | Camera clock + frame-buffer location (PSRAM/DRAM) |
 | `QUALITY_DEFAULT` | `src/config.h` | Boot quality preset |
@@ -211,8 +311,10 @@ Set the boot default with `QUALITY_DEFAULT` in `config.h`. Change at runtime:
 | `ESPNOW_SEND_RETRIES` | `src/config.h` | Per-segment retransmit budget |
 | `FRAME_ASSEMBLE_TIMEOUT_MS` | `receiver/src/receiver_config.h` | Stale-frame discard time |
 | `USB_MAGIC_HI/LO`, `USB_HEADER_BYTES`, `USB_BAUD` | `receiver/src/receiver_config.h` **+** `host/c3_usb_mjpeg.py` | USB CDC framing (keep in sync) |
+| `REC_STATUS_TAG`, `REC_CTRL_TAG_R/T/P` | `src/config.h` **+** `receiver/src/receiver_config.h` | Recording control/status datagrams (keep in sync) |
+| `[rx] REC state=…` line format | `receiver/src/receiver.cpp` **+** `host/c3_usb_mjpeg.py` (`REC_LINE_RE`) | Recording status the dashboard parses (keep in sync) |
 
-## 6) Notes & limitations
+## 7) Notes & limitations
 
 - `camera_pins.h` uses the authenticated pin set for this board from Seeed's
   CameraWebServer (XCLK=10, SIOD=40, SIOC=39, VSYNC=38, HREF=47, PCLK=13,
@@ -237,10 +339,18 @@ Set the boot default with `QUALITY_DEFAULT` in `config.h`. Change at runtime:
   corrupting the framed JPEG bytes that `host/c3_usb_mjpeg.py` expects.
 - The host viewer's HTTP server is multithreaded (`ThreadingHTTPServer`), so it
   can serve several phones/PCs at once; the C3 itself is never a TCP server.
+- The microSD recorder exists in the **ESP-NOW build only** (section 4) and is
+  fed from the same capture as the stream, so it costs no extra camera time;
+  `RECORD_PRIORITY_*` decides whose timing is protected when one frame slot
+  cannot afford both. Clips are written on the **sender** (the C3 has no card
+  slot and no PSRAM), and a clip is always a valid AVI even if it is cut short.
+- The recording state shown on the page is reported by the sender over ESP-NOW
+  (`[rx] REC …` lines the C3 prints). If the page says "no report yet", the
+  sender is still on the browser build (`STREAM_TARGET_BROWSER`) or switched off.
 
 ---
 
-## 7) Debugging a bad camera (`DEBUG_CAMERA` flag)
+## 8) Debugging a bad camera (`DEBUG_CAMERA` flag)
 
 If the camera looks dead (black/no stream, `[cam] init FAILED`, or endless
 `capture returned no frame`), turn on the debug flag in `src/config.h`:

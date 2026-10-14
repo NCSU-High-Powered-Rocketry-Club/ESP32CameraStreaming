@@ -15,6 +15,7 @@
 #include <driver/i2s.h>
 #endif
 #include "camera_hal.h"
+#include "recorder.h"      // microSD AVI recorder (ENABLE_SD_RECORDING)
 #include "stream_espnow.h"
 
 // --- ESP-NOW segment header (big-endian for portability) --------------------
@@ -37,6 +38,13 @@ static uint32_t txFrames = 0;        // frames we attempted to send
 static uint32_t txSegOk  = 0;        // segments ACKed by the C3
 static uint32_t txSegFail = 0;       // segments that exhausted all retries
 static uint32_t txSendErr = 0;       // esp_now_send() API errors
+
+// --- microSD recorder requests ----------------------------------------------
+// Set from the ESP-NOW control channel (C3 relay) or the serial console and
+// serviced by espnowPoll(): SD I/O must NOT run inside the WiFi-task receive
+// callback, which is on the RF receive path.
+static volatile bool recordStartRequest = false;
+static volatile bool recordStopRequest  = false;
 
 // ---------------------------------------------------------------------------
 // Microphone capture (PDM) - capture in a background task into a ring buffer;
@@ -189,6 +197,29 @@ void espNowOnRecv(const uint8_t* mac, const uint8_t* data, int len) {
     }
   }
 #endif
+#if ENABLE_SD_RECORDING
+  else if (len >= 2 && data[0] == 'R' && (data[1] == '0' || data[1] == '1')) {
+    // Dashboard: start / stop the microSD recording. Only a flag is set here -
+    // this callback runs in the WiFi task, so the SD write itself happens in
+    // espnowPoll() (see the note at recordStartRequest).
+    if (data[1] == '1') {
+      recordStartRequest = true;
+      recordStopRequest  = false;
+      Serial.println("[rec] start requested (dashboard)");
+    } else {
+      recordStopRequest  = true;
+      recordStartRequest = false;
+      Serial.println("[rec] stop requested (dashboard)");
+    }
+  }
+  else if (len >= 3 && data[0] == 'T') {
+    // Max clip length in seconds (0 = record until stopped).
+    recorderSetMaxSeconds((uint32_t)(((uint16_t)data[1] << 8) | (uint16_t)data[2]));
+  }
+  else if (len >= 2 && data[0] == 'P' && data[1] >= '0' && data[1] <= '2') {
+    recorderSetPriority((uint8_t)(data[1] - '0'));
+  }
+#endif
 }
 
 // Send one datagram and WAIT for the link ACK, retrying a few times. Used for
@@ -240,6 +271,46 @@ static bool espNowSendLossy(const uint8_t* buffer, size_t len) {
   }
   return true;   // queued; the link layer may still drop it - that is fine
 }
+
+#if ENABLE_SD_RECORDING
+// ---------------------------------------------------------------------------
+// Recording state report -> the C3, which echoes it as an "[rx] REC ..." line
+// that host/c3_usb_mjpeg.py shows (and parses) on the dashboard. Fire-and-
+// forget: the link is one-way and a lost report is replaced by the next one.
+//   {'S', on, sd, prio, framesHi, framesLo, leftHi, leftLo, idxHi, idxLo}
+// ---------------------------------------------------------------------------
+static void sendRecordStatus(bool force) {
+#if RECORD_STATUS_PERIOD_MS > 0
+  static uint32_t lastMs = 0;
+  if (!peerKnown) return;
+  if (!force && (millis() - lastMs) < RECORD_STATUS_PERIOD_MS) return;
+  lastMs = millis();
+
+  uint32_t frames = recorderFrameCount();
+  uint16_t idx    = recorderFileIndex();
+  // left: 0xFFFF = no limit configured, 0 = not recording, else seconds left.
+  uint16_t left = 0;
+  if (recorderActive()) {
+    left = recorderMaxSeconds() ? (uint16_t)recorderSecondsLeft() : 0xFFFF;
+  }
+
+  uint8_t msg[10];
+  msg[0] = (uint8_t)'S';
+  msg[1] = (uint8_t)(recorderActive() ? '1' : '0');
+  msg[2] = (uint8_t)(recorderSdReady() ? '1' : '0');
+  msg[3] = (uint8_t)('0' + recorderPriority());
+  msg[4] = (uint8_t)((frames > 0xFFFF ? 0xFFFF : frames) >> 8);
+  msg[5] = (uint8_t)(frames > 0xFFFF ? 0xFF : frames);
+  msg[6] = (uint8_t)(left >> 8);
+  msg[7] = (uint8_t)left;
+  msg[8] = (uint8_t)(idx >> 8);
+  msg[9] = (uint8_t)idx;
+  esp_now_send(peerMac, msg, sizeof(msg));
+#else
+  (void)force;   // status reports disabled
+#endif
+}
+#endif  // ENABLE_SD_RECORDING
 
 // Fill a 250-byte datagram with one segment.
 static uint16_t buildSegment(uint8_t* out, uint16_t frameId, uint16_t seg,
@@ -302,6 +373,18 @@ void espnowBegin() {
   esp_now_register_send_cb(&espNowOnSend);
   esp_now_register_recv_cb(&espNowOnRecv);
   micBegin();
+
+#if ENABLE_SD_RECORDING
+  // Mount the microSD card and apply the recorder defaults. Both are also
+  // settable at runtime from the dashboard (control channel) or the serial
+  // console; a missing card only disables recording, the stream still runs.
+  recorderSetMaxSeconds(RECORD_MAX_SECONDS);
+  recorderSetPriority(RECORD_PRIORITY_DEFAULT);
+  recorderBegin();
+  char st[96];
+  recorderStatusLine(st, sizeof(st));
+  Serial.printf("[rec] %s\n", st);
+#endif
 }
 
 static void setQuality(QualityLevel l) {
@@ -322,6 +405,57 @@ void espnowHandleSerialQ() {
     if (ch == 'q') { delay(5); if (Serial.available()) { char d = Serial.read(); int lv = d - '0';
       if (lv >= QUALITY_LOW && lv <= QUALITY_HIGH) setQuality((QualityLevel)lv); } }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Serial control from the S3's own console (main.cpp feeds every received char
+// here, because main.cpp is the only place that reads Serial - the old
+// espnowHandleSerialQ() drain above never sees anything as a result and is kept
+// only for API compatibility).
+//   q0/q1/q2   quality      r  start recording      e  stop recording
+//   D<secs>    max clip length (0 = unlimited)      P<0..2>  priority
+// Returns true when the char was consumed.
+// ---------------------------------------------------------------------------
+bool espnowHandleSerialKey(char ch) {
+  if (ch == 'q') {
+    delay(5);
+    if (Serial.available()) {
+      int lv = Serial.read() - '0';
+      if (lv >= QUALITY_LOW && lv <= QUALITY_HIGH) { setQuality((QualityLevel)lv); return true; }
+    }
+    return true;
+  }
+#if ENABLE_SD_RECORDING
+  if (ch == 'r') { recordStartRequest = true;  recordStopRequest = false;
+                   Serial.println("[rec] start requested (serial)"); return true; }
+  if (ch == 'e') { recordStopRequest  = true;  recordStartRequest = false;
+                   Serial.println("[rec] stop requested (serial)");  return true; }
+  if (ch == 'D') {
+    uint32_t secs = 0;
+    bool digits = false;
+    while (Serial.available()) {
+      char d = Serial.peek();
+      if (d < '0' || d > '9') break;
+      Serial.read();
+      digits = true;
+      secs = secs * 10 + (uint32_t)(d - '0');
+      if (secs > 100000) break;
+    }
+    if (!digits) { Serial.println("[rec] usage: D<seconds>  (D0 = until stopped)"); return true; }
+    recorderSetMaxSeconds(secs);
+    return true;
+  }
+  if (ch == 'P') {
+    delay(5);
+    if (Serial.available()) {
+      char d = Serial.read();
+      if (d >= '0' && d <= '2') { recorderSetPriority((uint8_t)(d - '0')); return true; }
+    }
+    Serial.println("[rec] usage: P<0..2>  (0 = SD first, 1 = balanced, 2 = stream first)");
+    return true;
+  }
+#endif
+  return false;
 }
 
 // Frame-level FPS cap.
@@ -358,6 +492,14 @@ static bool sendFrame(const uint8_t* frame, uint32_t len) {
 
 void espnowPoll() {
   espnowHandleSerialQ();
+#if ENABLE_SD_RECORDING
+  // Auto-stop a clip whose configured maximum length has elapsed...
+  bool wasRecording = recorderActive();
+  recorderTick();
+  // ...and service a stop request from the dashboard / serial.
+  if (recordStopRequest) { recordStopRequest = false; recorderStop(); }
+  if (wasRecording && !recorderActive()) sendRecordStatus(true);
+#endif
 #if ENABLE_MIC
   // Audio first (interleaved between video frames); a couple of 30 ms chunks
   // per pass keeps the ring buffer from overflowing without stealing airtime.
@@ -380,19 +522,81 @@ void espnowPoll() {
   camera_fb_t* fb = cameraCapture();
   if (!fb) { delay(5); return; }
 
+  // ONE capture, TWO consumers. Both the SD clip and the air link get the same
+  // JPEG, trimmed at its EOI marker (the OV3660 can hand back concatenated
+  // JPEGs / padding, and every consumer wants a self-contained image).
+  const size_t jlen = recorderJpegLength(fb->buf, fb->len);
+
+  // -------------------------------------------------------------------------
+  // microSD recording + priority arbitration.
+  //
+  // One frame costs (capture + SD write + air send) and the frame slot is
+  // 1000/max_fps ms. Whose timing is protected when the slot is too short for
+  // both is exactly what RECORD_PRIORITY_* decides:
+  //   SD       - write first, and skip the air copy if the card ate the slot
+  //   BALANCED - always do both (card first); the loop rate just adapts
+  //   STREAM   - send first, and skip the card if the link ate the slot
+  // -------------------------------------------------------------------------
+  bool streamThis = true;
+  bool delivered  = false;
+#if ENABLE_SD_RECORDING
+  bool recording = recorderActive();
+  if (recordStartRequest) {
+    // Serviced here, with a real frame in hand: the AVI header needs its size.
+    recordStartRequest = false;
+    if (recorderStart(fb->width, fb->height,
+                      p.max_fps > 0 ? (uint16_t)(p.max_fps + 0.5f) : RECORD_AVI_FPS)) {
+      recording = true;
+      sendRecordStatus(true);            // tell the dashboard immediately
+    }
+  }
+
+  const uint8_t prio = recorderPriority();
+  if (recording && prio != RECORD_PRIORITY_STREAM) {
+    uint32_t t0 = millis();
+    bool wrote = recorderWriteFrame(fb->buf, jlen);
+    uint32_t sdMs = millis() - t0;
+    if (!wrote) Serial.println("[rec] SD write failed (card removed/full?)");
+    if (prio == RECORD_PRIORITY_SD && p.max_fps > 0) {
+      uint32_t slotMs = (uint32_t)(1000.0f / p.max_fps);
+      if (slotMs && sdMs >= slotMs) {
+        streamThis = false;              // the card owns this frame slot
+      }
+    }
+  }
+#endif
+
   // Auto-downscale any frame that the receiver's RAM cannot hold.
-  if (fb->len > RECEIVER_MAX_FRAME_BYTES) {
-    cameraRelease(fb);
+  bool tooLargeForAir = (fb->len > RECEIVER_MAX_FRAME_BYTES);
+  if (streamThis && tooLargeForAir) {
+    streamThis = false;
     if (current > QUALITY_LOW) {
       Serial.printf("[espnow] frame too large - downscaling\n");
       setQuality((QualityLevel)(current - 1));
     }
-    return;
   }
 
-  bool delivered = sendFrame(fb->buf, fb->len);
+  if (streamThis) {
+    delivered = sendFrame(fb->buf, jlen);
+    txFrames++;
+  }
+
+#if ENABLE_SD_RECORDING
+  if (recording && prio == RECORD_PRIORITY_STREAM) {
+    if (streamThis) {
+      recorderWriteFrame(fb->buf, jlen); // the link is done: the card gets it now
+    } else {
+      recorderNoteSkippedFrame();        // link owned the slot (or frame too big)
+    }
+  }
+#endif
+
   cameraRelease(fb);
-  txFrames++;
+
+#if ENABLE_SD_RECORDING
+  // Periodic "REC ..." report for the dashboard (rate-limited internally).
+  sendRecordStatus(false);
+#endif
 
   // Periodic one-line TX status so a dead / one-way air link is visible on the
   // sender's serial console (the C3 cannot report anything back - one-way).
@@ -403,6 +607,8 @@ void espnowPoll() {
                   (unsigned)txFrames, (unsigned)txSegOk, (unsigned)txSegFail,
                   (unsigned)txSendErr, (int)current);
   }
+
+  if (!streamThis) return;               // SD-first kept this frame off the air
 
   if (!delivered && current > QUALITY_LOW) {
     setQuality((QualityLevel)(current - 1));   // lighten up and drop this frame

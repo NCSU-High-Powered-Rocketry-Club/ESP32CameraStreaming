@@ -18,6 +18,9 @@
   #include "stream_browser.h"
 #else
   #include "stream_espnow.h"
+  #if ENABLE_SD_RECORDING
+    #include "recorder.h"     // microSD AVI recorder (ESP-NOW target only)
+  #endif
 #endif
 
 static void printBanner() {
@@ -31,6 +34,9 @@ static void printBanner() {
   Serial.println("ESP32-C3 (dish receiver over ESP-NOW)");
 #endif
   Serial.println(" quality: q0/q1/q2 (LOW/MED/HIGH) | s = status");
+#if (STREAM_TARGET == STREAM_TARGET_ESP32C3) && ENABLE_SD_RECORDING
+  Serial.println(" SD rec : r = start, e = stop, D<secs> = max length, P<0..2> = priority");
+#endif
 #if DEBUG_CAMERA >= 1
   Serial.println(" debug  : d = dump diagnostics, t = camera bus sweep");
 #endif
@@ -42,6 +48,13 @@ void statusReport() {
   (void)p;
   Serial.printf("[main] quality default index = %d\n", QUALITY_DEFAULT);
   Serial.printf("[main] free heap = %u B\n", (unsigned)ESP.getFreeHeap());
+#if (STREAM_TARGET == STREAM_TARGET_ESP32C3) && ENABLE_SD_RECORDING
+  {
+    char rec[96];
+    recorderStatusLine(rec, sizeof(rec));
+    Serial.printf("[main] REC %s\n", rec);
+  }
+#endif
 #if DEBUG_CAMERA >= 1
   Serial.printf("[main] capture failures = %u\n", (unsigned)debugCaptureFailures());
 #endif
@@ -83,6 +96,12 @@ void loop() {
     if (c == 's') statusReport();
     if (c == 'd') debugDumpAll();     // full boot + camera diagnostic dump
     if (c == 't') debugCameraBusSweep();  // search for any mode that frames
+#if (STREAM_TARGET == STREAM_TARGET_ESP32C3)
+    // Quality (q0/q1/q2) and microSD recording control (r / e / D<secs> /
+    // P<0..2>) on the ESP-NOW target. main.cpp is the only Serial reader, so
+    // the stream module gets every char from here.
+    espnowHandleSerialKey(c);
+#endif
   }
 
 #if (STREAM_TARGET == STREAM_TARGET_BROWSER)

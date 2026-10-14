@@ -34,12 +34,25 @@ USB CDC modes: the C3 boots in **console mode** (readable banner/log lines, and
 the `m`/`s` commands work from `pio device monitor`). This script sends `g`
 right after opening the port to switch the C3 into **stream mode** (binary
 frames), and sends `x` on exit to hand the console back.
+
+Dashboard controls (HTTP `/ctl?cmd=...` -> the C3's serial console -> ESP-NOW
+broadcast -> the S3 sender). Single chars are written to the C3 as-is:
+    g / x        start / pause the USB frame stream
+    0 / 1 / 2    video quality preset (LOW / MED / HIGH)
+    M            toggle the sender's PDM microphone
+    r / e        start / stop the microSD recording ON THE SENDER   <- new
+    t<secs>      max clip length in seconds (t0 = until stopped)    <- new
+    p<0..2>      SD/stream priority (0 = SD first, 1 = balanced, 2 = stream) <- new
+The sender reports its recording state back over ESP-NOW; the C3 prints it as an
+`[rx] REC state=... idx=... frames=... left=... prio=... sd=...` line, which
+this script shows in the console pane AND parses into the SD-recording card.
 """
 import argparse
 import collections
 import glob
 import math
 import os
+import re
 import socket
 import sys
 import termios
@@ -56,12 +69,21 @@ HEADER = 12            # magic(2) + length(4) + frame id(2) + crc32(4)
 MAX_FRAME = 32 * 1024  # RECEIVER_MAX_FRAME_BYTES on the C3 (no PSRAM)
 AUDIO_RATE = 8000      # MIC_STREAM_RATE on the sender (Hz)
 BAUD_DEFAULT = 115200  # USB_BAUD / monitor_speed
+# Mirrors RECORD_MAX_SECONDS in src/config.h - only used to prefill the
+# dashboard's "max clip length" field so it matches the firmware default.
+REC_MAX_SECONDS_DEFAULT_TEXT = "30"
 
 _BAUD_TERMIOS = {
     9600: termios.B9600, 57600: termios.B57600,
     115200: termios.B115200, 230400: termios.B230400,
     460800: termios.B460800,
 }
+
+# The C3 prints one of these for every recording-status datagram it receives from
+# the S3 sender (see src/stream_espnow.cpp -> sendRecordStatus()). The dashboard
+# parses it so the SD-recording card shows the REAL state of the sender.
+REC_LINE_RE = re.compile(
+    r"\[rx\] REC state=(\w+) idx=(\d+) frames=(\d+) left=(\S+) prio=(\d) sd=(\d)")
 
 
 def _candidate_ports(port=None):
@@ -253,6 +275,14 @@ class StreamState:
         self.audio = collections.deque(maxlen=600)  # ~ 600*240B ≈ 18 s max
         self.audio_pkts = 0
         self.paused = False   # set by /ctl 'x' / 'g' - distinguishes pause vs dead
+        # SD recording on the SENDER, as reported by the C3's "[rx] REC ..."
+        # lines (the S3 -> C3 leg is one-way ESP-NOW, so this is the only
+        # feedback path). None = nothing heard yet.
+        self.rec = None             # dict(on, idx, frames, left, prio, sd)
+        self.rec_ts = 0.0           # when the last report arrived
+        # What the dashboard last ASKED for (the S3 does not echo settings back
+        # separately): shown next to the buttons so it is clear what was sent.
+        self.rec_set = {"seconds": REC_MAX_SECONDS_DEFAULT_TEXT, "prio": None}
 
     # ESP-NOW air-latency estimate: ~4 ms per 250-byte datagram (send + link
     # ACK + turnaround), plus ~40 ms capture/assemble/USB overhead. A rough
@@ -287,6 +317,29 @@ class StreamState:
     def get_log(self):
         with self._lock:
             return "\n".join(self.log)
+
+    def set_rec(self, line):
+        """Parse a C3 '[rx] REC ...' line into the sender's recording state.
+        Returns True when the line was one of ours (it is still logged)."""
+        m = REC_LINE_RE.search(line)
+        if not m:
+            return False
+        on, idx, frames, left, prio, sd = m.groups()
+        # Sanitise for the JSON in /status (the left field is free text:
+        # "-", "unlimited" or "17s").
+        left = re.sub(r"[^0-9A-Za-z-]", "", left)[:12]
+        with self._lock:
+            self.rec = {"on": on == "on", "idx": int(idx), "frames": int(frames),
+                        "left": left, "prio": int(prio), "sd": sd == "1"}
+            self.rec_ts = time.time()
+        return True
+
+    def rec_snapshot(self):
+        """(recording state dict or None, seconds since the last report)."""
+        with self._lock:
+            rec = dict(self.rec) if self.rec else None
+            age = (time.time() - self.rec_ts) if self.rec_ts else -1.0
+        return rec, age
 
 
 class AudioDenoise:
@@ -470,6 +523,9 @@ class SerialReader(threading.Thread):
                             line = parser.lines.pop(0)
                             print(f"[c3] {line}", flush=True)
                             self.state.add_log(line)
+                            # "[rx] REC ..." lines carry the SENDER's recording
+                            # state -> feed the dashboard's recording card.
+                            self.state.set_rec(line)
                     except Exception as exc:   # never let a bad chunk kill us
                         print(f"[serial] parse error: {exc}", flush=True)
                         self.state.errors += 1
@@ -599,6 +655,32 @@ font-size:12px' id='port'></span></h1>
       <button onclick="ctl('M')">🎤 MIC</button>
     </div><div class='s' id='ctlmsg'></div></div>
 </div>
+<h3>SD recording on the sender (ESP-NOW build only)</h3>
+<p class='foot' style='margin:0 0 6px'>Records the SAME frames the dish receives onto
+the S3's microSD card as a real .avi clip. The buttons travel
+dashboard → C3 → ESP-NOW → S3; the state below is reported back by the sender.</p>
+<div class='grid'>
+  <div class='card' style='text-align:center'><div class='l'>RECORDING</div>
+    <div style='display:flex;gap:8px;justify-content:center;margin-top:6px'>
+      <button onclick="ctl('r')">⏺ START REC</button>
+      <button onclick="ctl('e')">⏹ END REC</button>
+    </div><div class='s' id='recstat'>no report yet</div></div>
+  <div class='card' style='text-align:center'><div class='l'>END AFTER (SECONDS)</div>
+    <div style='display:flex;gap:6px;justify-content:center;margin-top:6px'>
+      <input id='recsecs' type='number' min='0' max='3600' value='30'
+             style='width:80px;background:var(--bg);color:var(--tx);
+                    border:1px solid var(--line);border-radius:6px;padding:5px 6px'>
+      <button onclick='setDur()'>SET</button>
+    </div><div class='s' id='durset'>the clip ends by itself after this many seconds
+    (0 = record until ⏹ END REC)</div></div>
+  <div class='card' style='text-align:center'><div class='l'>PRIORITY SD ↔ STREAM</div>
+    <div style='display:flex;gap:6px;justify-content:center;margin-top:6px'>
+      <button onclick="ctl('p0')">SD</button>
+      <button onclick="ctl('p1')">BALANCED</button>
+      <button onclick="ctl('p2')">STREAM</button>
+    </div><div class='s' id='prioset'>whose timing wins when one frame can't afford
+    both: SD keeps the clip's rate, STREAM keeps the stream's</div></div>
+</div>
 <div class='card' style='margin-bottom:12px'><div class='l'>MICROPHONE (S3, 8 kHz)</div>
   <div style='margin-top:6px'><button onclick='audioToggle()' id='abtn'>🔈 LISTEN</button>
   <span class='s' id='astat' style='margin-left:8px'></span></div>
@@ -673,6 +755,20 @@ setInterval(function(){
         'frames='+s.frames+' skips='+s.skips+' errs='+s.errors;
     document.getElementById('port').textContent = '@ '+s.port+
         (paused?'  ⏸ paused (button)':'');
+    // --- SD recording card (state REPORTED BY THE SENDER via the C3) --------
+    var rs=document.getElementById('recstat');
+    var pn={0:'SD first',1:'balanced',2:'stream first'};
+    if(s.rec_age<0 || s.rec_age>8){
+      rs.textContent='no report yet - is the S3 running the ESP-NOW build?';
+      rs.style.color='var(--dim)';
+    } else if(s.rec_on){
+      rs.textContent='⏺ REC clip #'+s.rec_idx+' · '+s.rec_frames+' frames · left '+
+        (s.rec_left==='unlimited'?'∞':s.rec_left)+' · '+(pn[s.rec_prio]||'?');
+      rs.style.color='var(--ok)';
+    } else {
+      rs.textContent='idle'+(s.rec_sd?'':' · no SD card detected on the S3');
+      rs.style.color=s.rec_sd?'var(--dim)':'var(--warn)';
+    }
     hist.push(live?s.fps:0); if(hist.length>120) hist.shift();
     draw('g_fps',hist);
   }).catch(function(){});
@@ -682,12 +778,26 @@ setInterval(function(){
     .catch(function(){});
 },1000);
 function ctl(c){
+  var names={g:'START stream',x:'PAUSE stream',M:'toggle MIC',
+             r:'START recording',e:'END recording',
+             '0':'quality LOW','1':'quality MED','2':'quality HIGH'};
+  if(c.charAt(0)==='t') names[c]='recording ends after '+c.slice(1)+' s';
+  if(c.charAt(0)==='p') names[c]='priority '+({0:'SD',1:'balanced',2:'stream'}[c.slice(1)]||'?');
   fetch('/ctl?cmd='+c,{cache:'no-store'}).then(function(r){return r.json()})
     .then(function(j){
       var m=document.getElementById('ctlmsg');
-      m.textContent = j.ok ? 'sent "'+c+'" to C3' : 'port not open';
-      setTimeout(function(){m.textContent=''},2000);
+      m.textContent = j.ok ? (names[c]||('sent "'+c+'"'))+' → sender' : 'port not open';
+      setTimeout(function(){m.textContent=''},2500);
     }).catch(function(){});
+}
+// "end after N seconds": sends t<N> to the C3, which relays it to the sender.
+function setDur(){
+  var v=document.getElementById('recsecs').value.replace(/[^0-9]/g,'');
+  if(v==='') v='0';
+  document.getElementById('durset').textContent =
+    (v==='0' ? 'the clip runs until ⏹ END REC is pressed'
+             : 'the clip ends by itself after '+v+' s');
+  ctl('t'+v);
 }
 function draw(id,data){
   var c=document.getElementById(id),g=c.getContext('2d');
@@ -764,17 +874,29 @@ class ViewerHandler(BaseHTTPRequestHandler):
             drop_pct = None
             if total_recent:
                 drop_pct = 100.0 * gaps_total / total_recent
+            # SD recording on the sender (from the C3's "[rx] REC ..." lines)
+            # plus the window of the last /ctl request, so the page can say
+            # whether it is talking to a build that even HAS the recorder.
+            rec, rec_age = self.state.rec_snapshot()
+            rec_on = "true" if (rec and rec["on"]) else "false"
+            rec_sd = "true" if (rec and rec["sd"]) else "false"
             body = ('{"seq":%d,"frames":%d,"skips":%d,"errors":%d,'
                     '"bytes":%d,"text":%d,"last_age":%.1f,"port":"%s",'
                     '"fps":%.1f,"kbps":%.0f,"avg_frame":%d,'
                     '"est_air_ms":%.0f,"gap_med_ms":%.0f,"gap_p95_ms":%.0f,'
-                    '"paused":%s,"drop_pct":%s}'
+                    '"paused":%s,"drop_pct":%s,'
+                    '"rec_on":%s,"rec_idx":%d,"rec_frames":%d,"rec_left":"%s",'
+                    '"rec_prio":%d,"rec_sd":%s,"rec_age":%.1f}'
                     % (st[1], st[2], st[3], st[4], st[5],
                        getattr(self.state, "text_bytes", 0), age,
                        self.state.port, fps, kbps, avg_b, est_lat,
                        med, p95,
                        "true" if self.state.paused else "false",
-                       "null" if drop_pct is None else "%.1f" % drop_pct)).encode()
+                       "null" if drop_pct is None else "%.1f" % drop_pct,
+                       rec_on, (rec["idx"] if rec else 0),
+                       (rec["frames"] if rec else 0),
+                       (rec["left"] if rec else "-"),
+                       (rec["prio"] if rec else -1), rec_sd, rec_age)).encode()
             self._send_headers("application/json", len(body))
             self.wfile.write(body)
         elif path == "/console":
@@ -789,19 +911,38 @@ class ViewerHandler(BaseHTTPRequestHandler):
             # old endless WAV header made browsers buffer until close).
             self._stream_audio()
         elif path == "/ctl":
-            # Dashboard controls: /ctl?cmd=g|g/x pause etc. Allowed chars only.
+            # Dashboard controls. Single chars (g/x/0/1/2/M/r/e) plus the SD
+            # recording commands the C3 relays to the sender:
+            #   r / e   start / stop the microSD recording on the S3
+            #   t<secs> max clip length (t0 = record until stopped)
+            #   p0..p2  recording/streaming priority
+            # The command is validated STRICTLY rather than filtered: a stray
+            # 'r' inside junk must not start a recording, and the old
+            # character-filter let "drop me!!r" through as "rper".
             from urllib.parse import urlparse, parse_qs, unquote
             qs = parse_qs(urlparse(self.path).query)
-            cmd = unquote(qs.get("cmd", [""])[0])
-            clean = "".join(c for c in cmd if c in "gx012M")
+            raw = unquote(qs.get("cmd", [""])[0]).strip()
+            clean = ""
+            if re.fullmatch(r"[gx012Mre]", raw):        # single-char commands
+                clean = raw
+            elif re.fullmatch(r"t\d{1,5}", raw):        # max clip length
+                clean = raw
+            elif re.fullmatch(r"p[0-2]", raw):          # SD/stream priority
+                clean = raw
             ok = bool(clean) and self.state.reader and \
                  self.state.reader.send_command(clean)
             # Track pause state so /status can tell the dashboard "stream
             # paused on purpose" apart from "link dead" (issue #4).
             if ok and clean == "g":
                 self.state.paused = False     # START resumes the stream
-            elif ok and "x" in clean:
+            elif ok and clean == "x":
                 self.state.paused = True      # PAUSE is deliberate
+            elif ok and clean.startswith("t"):
+                # Remember what we asked for - the S3 does not echo settings
+                # back separately, and the page shows the requested value.
+                self.state.rec_set["seconds"] = clean[1:] or "0"
+            elif ok and clean.startswith("p"):
+                self.state.rec_set["prio"] = clean[1:] or "?"
             body = b'{"ok":' + (b"true" if ok else b"false") + b"}"
             self._send_headers("application/json", len(body))
             self.wfile.write(body)

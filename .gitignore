@@ -4,3 +4,8 @@
 .vscode/launch.json
 .vscode/ipch
 compile_commands.json
+# clangd index cache
+.cache/
+# Python bytecode (host/c3_usb_mjpeg.py is stdlib-only, no venv needed)
+__pycache__/
+*.pyc

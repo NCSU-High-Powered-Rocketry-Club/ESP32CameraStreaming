@@ -12,3 +12,11 @@ void espnowPoll();
 
 // Runtime quality control from serial (shared with browser target).
 void espnowHandleSerialQ();
+
+// Per-character serial control on the S3's own console. main.cpp is the single
+// reader of Serial, so it feeds every received char here:
+//   q0/q1/q2   quality preset          r  start SD recording
+//   e          stop SD recording       D<secs>  max clip length (0 = unlimited)
+//   P<0..2>    recording/streaming priority
+// Returns true when the char was consumed (so callers can ignore 'false').
+bool espnowHandleSerialKey(char ch);

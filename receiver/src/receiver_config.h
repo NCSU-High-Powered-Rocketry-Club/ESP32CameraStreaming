@@ -54,6 +54,28 @@
 // so it can downscale faster. Requires ESPNOW_USE_NACK=1 on the sender too.
 #define ENABLE_ESPNOW_NACK  0
 
+// ---------------------------------------------------------------------------
+// Control / status tags (ESP-NOW, tiny tagged datagrams).
+// MUST stay in sync with src/config.h in the sender project (section 5b) and
+// with host/c3_usb_mjpeg.py (the 'R'/'T'/'P' dashboard buttons).
+//
+//   C3 -> S3 (broadcast, idempotent "set" commands, sent a few times):
+//     {'Q', '0'..'2'}                 video quality
+//     {'R', '0'|'1'}                  stop / start the microSD recording
+//     {'T', secHi, secLo}             max recording seconds (0 = unlimited)
+//     {'P', '0'..'2'}                 recording/streaming priority
+//     {'M'}                           toggle the sender's mic (NOT idempotent,
+//                                     so this one is sent exactly once)
+//   S3 -> C3 (to the peer MAC):
+//     {'S', on, sd, prio, frames(2BE), left(2BE), idx(2BE)}
+//   The C3 prints each status datagram as "[rx] REC state=... idx=... ...",
+//   which host/c3_usb_mjpeg.py surfaces (and parses) on the dashboard.
+// ---------------------------------------------------------------------------
+#define REC_STATUS_TAG   'S'
+#define REC_CTRL_TAG_R   'R'
+#define REC_CTRL_TAG_T   'T'
+#define REC_CTRL_TAG_P   'P'
+
 // --- Audio (PDM mic stream from the sender) ----------------------------------
 // Air audio datagram: [0xA3 0xA5][seq:2BE] + PCM bytes (8 kHz unsigned 8-bit).
 // Forwarded over USB with the SAME 12-byte header framing as video but with

@@ -96,7 +96,46 @@ still reproduces, instrumenting the C3 to log WHICH port the 'x' came from
 
 ---
 
-## Context snapshot (updated 2026-09-14)
+## 6. Serial quality/recording keys — dispatch is split between two readers
+
+**Status: WORKED AROUND (2026-10-13) — underlying duplication still present.**
+
+`main.cpp`'s loop drains `Serial` completely before `espnowPoll()` /
+`browserPoll()` run, so `espnowHandleSerialQ()` and `browserHandleSerialQ()`
+never see a character — i.e. the README's "serial `q0`/`q1`/`q2` works in both
+targets" is not actually true today. The new microSD recorder keys (`r`, `e`,
+`D<secs>`, `P<0..2>`) were therefore dispatched from `main.cpp` into
+`espnowHandleSerialKey()`, which also finally makes `q0/q1/q2` reach the ESP-NOW
+stream module. Left as-is because unifying the dispatch touches the browser
+target too. If you want one reader, move each target's serial handling into a
+single per-target hook called from `main.cpp` and delete both `*HandleSerialQ()`.
+
+---
+
+## 7. microSD recording (merged from camera.zip) — what is verified, what is not
+
+**Status: IMPLEMENTED + UNIT/INTEGRATION VERIFIED (2026-10-13); needs hardware.**
+
+- Merged the standalone AVI-recorder sketch into `src/recorder.cpp/.h`; the
+  ESP-NOW loop captures once and feeds the card and the air from the same JPEG.
+  `RECORD_PRIORITY_*` chooses whose timing is protected (SD / BALANCED / STREAM).
+- Dashboard controls + live status (see README §4 / AI_README §11). `/ctl` now
+  validates commands strictly instead of filtering characters — before this
+  change, junk like `"drop me!!r"` was accepted as `"rper"` (it could have
+  started a recording).
+- Verified without hardware: both `STREAM_TARGET` builds and the receiver build
+  clean; `recorder.cpp` compiled natively and executed (settings clamping, EOI
+  trimming, clip numbering, duration auto-stop) with its `.avi` output checked by
+  `ffprobe` and a direct RIFF/`idx1` parse; the host script driven over real HTTP
+  (parser, `/status`, every `/ctl` command, malformed-command rejection,
+  firmware↔host status-line format sync).
+- **Not verified:** the S3↔C3 control/status datagrams over the air, the real SD
+  card (speed / FAT32 / J3 pad), the dashboard buttons end-to-end, and the
+  priority behaviour under a genuinely saturated link.
+
+---
+
+## Context snapshot (updated 2026-10-13)
 
 - Video S3→C3→USB→dashboard works; C3 reassembles 8–14 KB frames reliably.
 - Audio chain end-to-end; host serves `/audio.pcm`, dashboard plays it live
@@ -107,3 +146,6 @@ still reproduces, instrumenting the C3 to log WHICH port the 'x' came from
   /audio.wav backlog flush (superseded by /audio.pcm).
 - Firmware build (`pio run -e esp32s3_sense_sender`) passes; host script
   syntax-checked and HTTP endpoints smoke-tested without hardware.
+- 2026-10-13: microSD recording merged in from `camera.zip` (issues #6, #7);
+  recorder lives in the ESP-NOW build only, driven from the dashboard or the
+  S3's serial console, with a selectable SD-vs-stream priority.
