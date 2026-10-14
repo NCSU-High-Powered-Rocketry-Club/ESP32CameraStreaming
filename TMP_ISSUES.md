@@ -135,6 +135,41 @@ single per-target hook called from `main.cpp` and delete both `*HandleSerialQ()`
 
 ---
 
+## 8. RESOLVED: "camera failed" after the recorder merge was a 16 MHz XCLK
+
+**Status: FIXED (2026-10-13) — measured on the board, not guessed.**
+
+Symptom: `esp_camera_init -> ESP_OK`, sensor detected (OV3660, SCCB addr 0x3C),
+then every `esp_camera_fb_get()` returned nothing and the frame count never rose.
+
+Evidence, in order:
+
+1. `'t'` bus sweep on the live board: **20 MHz PSRAM/DRAM and 10 MHz PSRAM/DRAM
+   all frame a real JPEG; 16 MHz frames NOTHING (both buffer locations).**
+   So the module/ribbon data path is ALIVE.
+2. The build with `ENABLE_SD_RECORDING 0` (SD mount never runs) still failed at
+   16 MHz, boot included -> **the microSD recorder was not the cause.**
+3. Git history: `CAMERA_XCLK_HZ 16000000` is absent from the initial commit and
+   arrived with the pre-existing uncommitted work, i.e. it was never part of the
+   recorder merge.
+
+Fix: `CAMERA_XCLK_HZ 20000000` (the board default). Re-flashed and verified:
+`capture failures = 0`, the ESP-NOW TX counter climbed (`frames=6→40`), and the
+recorder reported a mounted card (`REC state=off ... sd=1`).
+
+Lesson: 16 MHz on the ESP32-S3 switches on the experimental PSRAM-DMA path that
+breaks JPEG capture. It looks exactly like a dead camera module (this is the
+second time on this project that "dead camera" was not hardware). Always run `t`
+before handling the ribbon.
+
+Note from the same session: at the earlier (16 MHz) boot the sender reported
+`sd=0` (card not mounted) and it reports `sd=1` now; the camera being in its
+broken 16 MHz DMA state at boot is the likeliest reason the SD/SPI mount failed
+then, but that is inferred, not measured - if it recurs, check the card is
+seated/FAT32 and watch the `[rec] mounting microSD...` lines at boot.
+
+---
+
 ## Context snapshot (updated 2026-10-13)
 
 - Video S3→C3→USB→dashboard works; C3 reassembles 8–14 KB frames reliably.

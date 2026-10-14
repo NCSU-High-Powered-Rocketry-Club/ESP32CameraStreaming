@@ -407,5 +407,22 @@ continues afterwards. Two details:
   (`CAMERA_FB_IN_PSRAM` by default). Set it to `CAMERA_FB_IN_DRAM` to test a
   module that frames only on the internal-RAM path.
 
+Measured on this board's OV3660 with the sweep (2026-10-13):
+
+| Mode | Result |
+|------|--------|
+| XCLK 20 MHz, PSRAM buffers | frames a real JPEG |
+| XCLK 20 MHz, DRAM buffers  | frames a real JPEG |
+| XCLK 10 MHz, PSRAM buffers | frames a real JPEG |
+| XCLK 10 MHz, DRAM buffers  | frames a real JPEG |
+| XCLK 16 MHz, both          | init OK, **zero frames** |
+
+So "SCCB ID reads fine but it never frames" is not automatically a dead module:
+if the sweep shows *some* clock working, it is a settings problem - put a working
+value in `CAMERA_XCLK_HZ`. 16 MHz is the ESP32-S3 PSRAM-DMA path and breaks JPEG
+capture on this hardware; keep the clock at 20 MHz (or 10 MHz). A camera that
+fails every capture while the sweep works at 20 MHz is a `config.h` problem, not
+a hardware one - which is exactly how a wrong XCLK masquerades as a dead module.
+
 `DEBUG_CAMERA 0` compiles every diagnostic out (no size/speed cost, no output) —
 use that for a "production" build once the hardware is known good.

@@ -269,6 +269,11 @@ tell the two apart, and is fully compiled out at `0` (no size/speed/noise cost).
   counts if it is >= 512 B and starts `FF D8` (a smaller buffer is a stale
   DMA buffer, not a picture). The normal clock is `CAMERA_XCLK_HZ` and the
   frame-buffer location is `CAMERA_FB_LOCATION` (PSRAM default) in `config.h`.
+  **Measured on this board's OV3660 (2026-10-13): 20 MHz and 10 MHz frame,
+  16 MHz does NOT (init OK, 0 bytes) - 16 MHz is the ESP32-S3 PSRAM-DMA path
+  that breaks JPEG capture.** So when the sweep says 4/6 modes work, the
+  "camera failed" is a `config.h` clock problem, not a dead module; set
+  `CAMERA_XCLK_HZ 20000000`.
 - Sweep takes ~2.5 min when every mode fails (each failed capture waits for the
   esp_camera timeout). `gdma_disconnect` error lines during the sweep are the
   driver's de-init noise and are harmless.

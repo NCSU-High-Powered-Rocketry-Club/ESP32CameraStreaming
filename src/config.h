@@ -15,7 +15,7 @@
 #define STREAM_TARGET_ESP32C3  2   // Segmented ESP-NOW frames to the dish ESP32-C3
 
 // <-- CHANGE THIS ONE LINE TO PICK WHO RECEIVES THE VIDEO -->
-#define STREAM_TARGET  STREAM_TARGET_BROWSER
+#define STREAM_TARGET  STREAM_TARGET_ESP32C3
 
 #if (STREAM_TARGET != STREAM_TARGET_BROWSER) && (STREAM_TARGET != STREAM_TARGET_ESP32C3)
 #error "STREAM_TARGET must be STREAM_TARGET_BROWSER or STREAM_TARGET_ESP32C3"
@@ -37,7 +37,13 @@
 // data bus may be marginal - trying 16 MHz (also enables EDMA mode on the S3)
 // or 10 MHz sometimes revives a flaky module. The serial 't' command sweeps
 // these automatically (see DEBUG_CAMERA).
-#define CAMERA_XCLK_HZ   16000000
+//
+// MEASURED on this board's OV3660 with the 't' sweep (2026-10-13): 20 MHz
+// PSRAM/DRAM and 10 MHz PSRAM/DRAM all frame a real JPEG, 16 MHz does NOT
+// (init OK, zero bytes captured) - 16 MHz switches on the experimental
+// PSRAM-DMA path that breaks JPEG capture on the ESP32-S3. Keep this at
+// 20000000 unless a sweep on YOUR module says otherwise.
+#define CAMERA_XCLK_HZ   20000000
 
 // Frame-buffer location. CAMERA_FB_IN_PSRAM (default) uses the 8 MB PSRAM
 // (EDMA path). If a module initialises and its SCCB ID reads fine but it only
