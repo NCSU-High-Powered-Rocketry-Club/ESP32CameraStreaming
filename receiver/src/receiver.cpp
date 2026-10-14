@@ -1,13 +1,32 @@
 // receiver.cpp - ESP32-C3 "dish" side: reassembles segmented ESP-NOW frames
-// from the S3 Sense and re-serves them as an MJPEG stream.
+// from the S3 Sense and forwards each complete JPEG over USB CDC (Serial) to a
+// host that re-serves it as MJPEG. The C3 no longer serves video over Wi-Fi
+// itself - that was half-duplex and contended with RF reception.
+//
+// Wiring:
+//   S3 (airborne) --ESP-NOW--> C3 dish --USB CDC (wired)--> host (Pi/laptop)
+//                               | RF receive + reassemble + forward
+//                               (no RF TX while serving)
 //
 // Usage:
 //   1. Wire the C3's antenna to the dish / high-gain element for the link.
-//   2. Print this board's MAC (serial 'm') after it connects.
+//   2. Open `pio device monitor` (or press reset after opening it) - the board
+//      greets you in console mode with its MAC ('m' prints it again).
 //   3. Put that MAC into the sender (config.h -> ESPNOW_PEER_MAC).
-//   4. Connect a phone/PC to the S3 AP ("XIAO-Sense") and open  http://192.168.4.2/
+//   4. Plug the C3 into the host over USB, then run:
+//        python3 host/c3_usb_mjpeg.py
+//      (it sends 'g' to switch USB to the frame stream) and open
+//      http://<host>:8080/
 //
-// Serial:  m = print MAC, s = status
+// USB CDC (Serial = TinyUSB):
+//     TWO modes, switched at runtime:
+//       console  (default)  -> readable banner/logs + m/s commands (pio monitor)
+//       stream              -> binary framed JPEG stream (host sends 'g' to
+//                              start it, 'x' or unplug returns to console)
+//     availableForWrite() gates the writer so a slow host NEVER blocks the RF
+//     receive/reassemble loop - if the USB buffer is full we drop/skip frames.
+// Hardware UART (Serial0 = GPIO21 TX): mirrors diagnostics in every mode.
+//     m = print MAC, s = status, g = start USB stream, x = stop USB stream
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -20,6 +39,7 @@ static uint8_t  assembleBuf[RECEIVER_MAX_FRAME_BYTES];
 static uint8_t  latestBuf[RECEIVER_MAX_FRAME_BYTES];
 static uint32_t latestLen = 0;
 static uint16_t latestFrameId = 0;
+static uint32_t rxFrames = 0;       // ESP-NOW frames completed (any source)
 
 #define MAX_SEGMENTS  ((RECEIVER_MAX_FRAME_BYTES + NOW_PAYLOAD_BYTES - 1) / NOW_PAYLOAD_BYTES + 1)
 static uint8_t  segBitmap[(MAX_SEGMENTS + 7) / 8];
@@ -30,11 +50,96 @@ static uint16_t asmTailPlen = 0;    // payload len of the highest segment seen
 static uint32_t asmCount   = 0;     // distinct segments seen
 static uint32_t asmLastMs  = 0;     // for stale-frame timeout
 
+// Mutex guarding latestBuf/latestLen: onRecv() runs in the WiFi task while
+// pumpUsb() runs in the loop task, so snapshotting a frame (crc32 over it,
+// which takes ~ms) without a lock let a new frame overwrite latestBuf mid-
+// snapshot - header CRC of the old buffer + payload of the new one, i.e. EVERY
+// frame failed the host's CRC check.
+static SemaphoreHandle_t latestMutex = nullptr;
+
+// "WiFi lost" log re-arm flag (shared by the loop() watchdog below).
+static bool wifiDownLogged = false;
+static void downLoggedReset() { wifiDownLogged = false; }
+
+// Broadcast address for the control back-channel to the S3 sender.
+static const uint8_t BCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+// ---------------------------------------------------------------------------
+// Audio path (8 kHz unsigned 8-bit PCM from the sender's PDM mic).
+// onRecv appends tagged audio payloads into a FIFO; pumpUsbAudio() drains it
+// to the USB host with the standard 12-byte header (audio magic). Audio never
+// blocks: if the host is slow or the FIFO is full, audio is dropped.
+// ---------------------------------------------------------------------------
+static uint8_t  audioFifo[AUDIO_FIFO_BYTES];
+static volatile uint32_t audioIn = 0, audioOut = 0, audioDrop = 0;
+static uint16_t audioLastSeq = 0;
+static uint8_t  audioHdr[USB_HEADER_BYTES];
+
+static uint32_t audioFifoAvail() { return (audioIn >= audioOut) ? audioIn - audioOut
+                                            : AUDIO_FIFO_BYTES - audioOut + audioIn; }
+static uint32_t audioFifoFree()  { return AUDIO_FIFO_BYTES - 1 - audioFifoAvail(); }
+
 static bool segBitGet(unsigned idx) { return (segBitmap[idx >> 3] & (uint8_t)(1u << (idx & 7))) != 0; }
 static void segBitSet(unsigned idx) { segBitmap[idx >> 3] |= (uint8_t)(1u << (idx & 7)); }
 static void segBitClear() { for (unsigned i = 0; i < sizeof(segBitmap); ++i) segBitmap[i] = 0; }
 
+// ---------------------------------------------------------------------------
+// USB CDC forwarder state (non-blocking pump; mirrors the sender's time-slice
+// pattern so one slow host can never stall the RF receive loop).
+// ---------------------------------------------------------------------------
+static uint8_t  outBuf[USB_HEADER_BYTES];  // prebuilt framing header
+static volatile uint8_t outState = 0;      // 0 idle, 1 delivering a frame
+static uint32_t outLen   = 0;              // payload length of frame being sent
+static size_t   outOff   = 0;              // bytes of payload already flushed
+static uint8_t  outHdrPos = 0;             // header bytes queued so far
+static uint32_t usbFrames = 0;             // frames written to the host
+static bool     usbStreaming = false;     // false = readable console on USB,
+                                          // true = binary frame stream (host sent 'g')
+
+// Max payload bytes pushed per loop pass (availableForWrite() caps us too).
+static const size_t USB_SEND_SLICE_BYTES = 1024;
+
+// --- CRC-32 (ISO-HDLC / zlib polynomial 0xEDB88320) --------------------------
+// Same standard as Python's zlib.crc32 so the host can validate each frame.
+static uint32_t crc32Table[256];
+static bool     crc32Ready = false;
+
+static void crc32Init() {
+  for (uint32_t i = 0; i < 256; ++i) {
+    uint32_t c = i;
+    for (int k = 0; k < 8; ++k)
+      c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+    crc32Table[i] = c;
+  }
+  crc32Ready = true;
+}
+
+static uint32_t crc32(const uint8_t* data, size_t len) {
+  if (!crc32Ready) crc32Init();
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < len; ++i)
+    c = crc32Table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
+}
+
 void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
+  // Audio datagrams: [0xA3 0xA5][seq:2BE] + PCM. Never touch video state.
+  if (len > 4 && data[0] == (AUDIO_AIR_MAGIC >> 8) &&
+      data[1] == (AUDIO_AIR_MAGIC & 0xFF)) {
+    uint16_t seq = (uint16_t)((data[2] << 8) | data[3]);
+    size_t plen = (size_t)(len - 4);
+    audioLastSeq = seq;
+    if (audioFifoFree() >= plen) {
+      size_t n = (audioIn + plen > AUDIO_FIFO_BYTES)
+                 ? AUDIO_FIFO_BYTES - audioIn : plen;      // handle wrap
+      memcpy(audioFifo + audioIn, data + 4, n);
+      if (n < plen) memcpy(audioFifo, data + 4 + n, plen - n);
+      audioIn = (audioIn + plen) % AUDIO_FIFO_BYTES;
+    } else {
+      audioDrop++;                        // host too slow - drop, never block
+    }
+    return;
+  }
   if (len < NOW_HEADER_BYTES) return;
 
   uint16_t magic   = (uint16_t)((data[0] << 8) | data[1]);
@@ -71,11 +176,30 @@ void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
   if (seg + 1 == total && asmCount >= total) {
     // Real byte count = all-but-last full segments + short tail.
     uint32_t realLen = (uint32_t)(total - 1) * NOW_PAYLOAD_BYTES + asmTailPlen;
-    memcpy(latestBuf, assembleBuf, realLen);
-    latestLen = realLen;
-    latestFrameId = frameId;
-    asmFrameId = 0xFFFF;   // next new frame restarts cleanly
-    Serial.printf("[rx] frame %u ok (%u B, %u seg)\n", frameId, realLen, total);
+
+    // Only hand the host a NEW frame if we are not mid-delivery over USB -
+    // otherwise the pump is reading latestBuf and a write here would tear it.
+    if (outState == 0) {
+      // Claim the mutex so the pump cannot snapshot this frame while we are
+      // still copying it (and vice versa - see note at latestMutex).
+      if (latestMutex && xSemaphoreTake(latestMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        asmFrameId = 0xFFFF;               // pump busy with the previous frame
+        rxFrames++;
+        return;
+      }
+      memcpy(latestBuf, assembleBuf, realLen);
+      latestLen = realLen;
+      latestFrameId = frameId;
+      asmFrameId = 0xFFFF;   // next new frame restarts cleanly
+      rxFrames++;
+      if (latestMutex) xSemaphoreGive(latestMutex);
+      Serial0.printf("[rx] frame %u ok (%u B, %u seg)\n", frameId, realLen, total);
+      if (!usbStreaming)     // console mode: USB monitor can show this too
+        Serial.printf("[rx] frame %u ok (%u B, %u seg)\n", frameId, realLen, total);
+    } else {
+      asmFrameId = 0xFFFF;   // still re-arm, we just skip handing it over
+      rxFrames++;
+    }
   }
 }
 
@@ -88,88 +212,295 @@ void checkAssembleTimeout() {
     asmFrameId = 0xFFFF;
   }
 }
+// ---------------------------------------------------------------------------
+// Non-blocking USB CDC pump. Each loop pass we flush a bounded slice of the
+// latest frame; if Serial's write buffer is full (slow host / no host plugged
+// in) availableForWrite() returns tiny/zero and we drop the frame instead of
+// ever blocking the RF path. The host re-syncs by scanning for the magic.
+// ---------------------------------------------------------------------------
+static void pumpUsb() {
+  if (!usbStreaming || !Serial) return;   // console mode / no USB host: no frames
+
+  // Start a fresh frame only when we can fit its whole header without blocking.
+  if (outState == 0) {
+    if (!latestLen) return;
+    if ((size_t)Serial.availableForWrite() < USB_HEADER_BYTES) return; // host busy - defer
+    // Lock the frame while we CRC + snapshot it. crc32 over a ~30 KB frame
+    // takes ~ms, and onRecv() (WiFi task) overwrites latestBuf freely - this
+    // lock is what keeps header/payload/CRC from coming from different frames.
+    if (latestMutex && xSemaphoreTake(latestMutex, 0) != pdTRUE) return; // busy - defer
+    uint32_t crc = crc32(latestBuf, latestLen);
+    outBuf[0] = (uint8_t)USB_MAGIC_HI;
+    outBuf[1] = (uint8_t)USB_MAGIC_LO;
+    outBuf[2] = (uint8_t)(latestLen >> 24); outBuf[3] = (uint8_t)(latestLen >> 16);
+    outBuf[4] = (uint8_t)(latestLen >> 8);  outBuf[5] = (uint8_t)(latestLen);
+    outBuf[6] = (uint8_t)(latestFrameId >> 8); outBuf[7] = (uint8_t)(latestFrameId);
+    outBuf[8] = (uint8_t)(crc >> 24);  outBuf[9]  = (uint8_t)(crc >> 16);
+    outBuf[10] = (uint8_t)(crc >> 8);  outBuf[11] = (uint8_t)(crc);
+    outLen = latestLen;
+    outOff = 0;
+    outHdrPos = 0;
+    outState = 1;
+    if (latestMutex) xSemaphoreGive(latestMutex);
+  }
+
+  // Push header+payload in bounded slices; never block, and always honour the
+  // byte count write() actually queued (a short write must not shift outOff,
+  // or the host's CRC would fail on every frame). IMPORTANT: if the USB write
+  // buffer is full mid-frame we simply RETURN and resume next pass - we must
+  // NOT reset outState, because the header (and possibly part of the payload)
+  // is already on the wire. Aborting and re-starting the frame would inject a
+  // duplicate header inside the previous payload and desync the host's parser
+  // on every frame. onRecv() won't overwrite latestBuf while outState==1.
+  uint32_t pushed = 0;
+  while (outState == 1 && pushed < USB_SEND_SLICE_BYTES) {
+    size_t freeNow = (size_t)Serial.availableForWrite();
+    if (freeNow == 0) return;                          // host busy - resume next pass
+
+    if (outHdrPos < USB_HEADER_BYTES) {                // header, byte-exact
+      size_t n = USB_HEADER_BYTES - outHdrPos;
+      if (n > freeNow) n = freeNow;
+      size_t w = Serial.write(outBuf + outHdrPos, n);
+      if (w == 0) return;                              // resume next pass
+      outHdrPos += (uint8_t)w;
+      pushed += (uint32_t)w;
+      continue;
+    }
+
+    size_t left = outLen - outOff;
+    if (left == 0) {
+      outState = 0;
+      latestLen = 0;   // consumed - do NOT resend the same frame forever
+      usbFrames++;
+      return;
+    }
+    size_t chunk = left;
+    if (chunk > freeNow) chunk = freeNow;
+    if (chunk > (USB_SEND_SLICE_BYTES - pushed)) chunk = USB_SEND_SLICE_BYTES - pushed;
+    size_t w = Serial.write(latestBuf + outOff, chunk);
+    if (w == 0) return;                                // resume next pass
+    outOff += w;
+    pushed += (uint32_t)w;
+  }
+}
+
+// Drain the audio FIFO to the USB host (8 kHz unsigned 8-bit PCM, tagged with
+// the audio magic so the host can separate it from JPEG frames). Never blocks
+// and never interleaves with a video frame's delivery; slow host = dropped
+// audio, which beats blocking the RF path.
+static void pumpUsbAudio() {
+  if (!usbStreaming || !Serial) return;
+  if (outState != 0) return;              // never interleave with a video frame
+  uint32_t avail = audioFifoAvail();
+  if (!avail) return;
+  if (avail > 240) avail = 240;           // one USB packet per pass
+  if ((size_t)Serial.availableForWrite() < USB_HEADER_BYTES + avail) return;
+
+  audioHdr[0] = (uint8_t)USB_AUDIO_MAGIC_HI;
+  audioHdr[1] = (uint8_t)USB_AUDIO_MAGIC_LO;
+  audioHdr[2] = (uint8_t)(avail >> 24); audioHdr[3] = (uint8_t)(avail >> 16);
+  audioHdr[4] = (uint8_t)(avail >> 8);  audioHdr[5] = (uint8_t)(avail);
+  audioHdr[6] = (uint8_t)(audioLastSeq >> 8); audioHdr[7] = (uint8_t)(audioLastSeq);
+  uint32_t crc = crc32(audioFifo + audioOut, avail);
+  audioHdr[8] = (uint8_t)(crc >> 24); audioHdr[9] = (uint8_t)(crc >> 16);
+  audioHdr[10] = (uint8_t)(crc >> 8); audioHdr[11] = (uint8_t)(crc);
+  Serial.write(audioHdr, USB_HEADER_BYTES);
+  size_t n = (audioOut + avail > AUDIO_FIFO_BYTES)
+             ? AUDIO_FIFO_BYTES - audioOut : avail;         // handle wrap
+  Serial.write(audioFifo + audioOut, n);
+  if (n < avail) Serial.write(audioFifo, avail - n);
+  audioOut = (audioOut + avail) % AUDIO_FIFO_BYTES;
+}
 
 // ---------------------------------------------------------------------------
-// Minimal MJPEG server so a phone/PC on the S3 AP can view the dish stream.
+// Commands (accepted on BOTH ports). 'g'/'x' switch the USB CDC between the
+// readable console (pio monitor: banner, logs, m/s) and the binary frame
+// stream that host/c3_usb_mjpeg.py consumes. 'm'/'s' always answer on the
+// hardware UART; on USB they only echo in console mode, so text can never be
+// interleaved into the framed JPEG stream.
 // ---------------------------------------------------------------------------
-static WiFiServer srv;
-static const char INDEX_HTML[] =
-  "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-  "<title>Dish RX</title></head><body style='background:#000;color:#eee'>"
-  "<h2>ESP32-C3 dish receiver</h2>"
-  "<img src='/stream' style='width:100%;max-width:640px'><br>"
-  "<span id='m'>status</span><script>"
-  "f=document.getElementById('m');"
-  "setInterval(function(){f.textContent='receiving frames '+(new Date().toTimeString());},1000);"
-  "</script></body></html>";
+static void handleCommand(char ch) {
+  if (ch == 'g') {                       // host viewer: start the frame stream
+    usbStreaming = true;
+    outState = 0;                        // drop any stale partial delivery
+    audioOut = audioIn;                  // flush stale audio, start fresh
+    Serial0.println("[rx] USB CDC -> STREAM mode (binary frames to host)");
+  } else if (ch == '0' || ch == '1' || ch == '2') {
+    // Quality control from the dashboard: relay as an ESP-NOW broadcast to
+    // the S3 sender ('Q' + level). Cheap 2-byte datagram, sent a few times
+    // for robustness (broadcasts are not ACKed).
+    uint8_t cmd[2] = { (uint8_t)'Q', (uint8_t)ch };
+    esp_err_t e = esp_now_send(BCAST_MAC, cmd, sizeof(cmd));
+    Serial0.printf("[rx] quality %c -> S3 (%s)\n", ch,
+                   e == ESP_OK ? "sent" : "SEND FAILED");
+    if (!usbStreaming)
+      Serial.printf("[rx] quality %c -> S3 (%s)\n", ch,
+                    e == ESP_OK ? "sent" : "SEND FAILED");
+  } else if (ch == 'M') {                // dashboard: toggle sender microphone
+    uint8_t cmd = (uint8_t)'M';
+    esp_err_t e = esp_now_send(BCAST_MAC, &cmd, 1);
+    Serial0.printf("[rx] mic toggle -> S3 (%s)\n",
+                   e == ESP_OK ? "sent" : "SEND FAILED");
+  } else if (ch == 'x') {                // host closing / manual stop
+    usbStreaming = false;
+    outState = 0;
+    Serial0.println("[rx] USB CDC -> CONSOLE mode (m/s available)");
+    Serial.println("[rx] console mode (m = MAC, s = status)");
+  } else if (ch == 'm') {
+    uint8_t d[6]; WiFi.macAddress(d);
+    Serial0.printf("MAC %02X:%02X:%02X:%02X:%02X:%02X IP %s\n",
+                   d[0],d[1],d[2],d[3],d[4],d[5], WiFi.localIP().toString().c_str());
+    if (!usbStreaming)
+      Serial.printf("MAC %02X:%02X:%02X:%02X:%02X:%02X IP %s\n",
+                    d[0],d[1],d[2],d[3],d[4],d[5], WiFi.localIP().toString().c_str());
+  } else if (ch == 's') {
+    Serial0.printf("latest frame #%u len %u  espnow rx %u  usb written %u  mode %s\n",
+                   latestFrameId, (unsigned)latestLen, (unsigned)rxFrames,
+                   (unsigned)usbFrames, usbStreaming ? "stream" : "console");
+    if (!usbStreaming)
+      Serial.printf("latest frame #%u len %u  espnow rx %u  usb written %u  mode %s\n",
+                    latestFrameId, (unsigned)latestLen, (unsigned)rxFrames,
+                    (unsigned)usbFrames, usbStreaming ? "stream" : "console");
+  }
+}
+
+static void handleSerialInput() {
+  while (Serial0.available()) handleCommand(Serial0.read());
+  while (Serial.available())  handleCommand(Serial.read());
+}
+
+// ---------------------------------------------------------------------------
+// Console banner. TinyUSB drops every Serial write while the USB host has not
+// asserted DTR, so text printed "at boot" is lost if the monitor is opened
+// later. We therefore re-greet on EVERY fresh USB attach (monitor or host
+// viewer) - opening `pio device monitor` always shows something, and the host
+// viewer can show the banner as on-page proof of which board it is talking to.
+// ---------------------------------------------------------------------------
+static bool usbConnected = false;
+
+static void consoleHello() {
+  uint8_t d[6]; WiFi.macAddress(d);
+  const char* line1 = "\n[rx] ESP32-C3 dish receiver | WiFi '%s' | MAC %02X:%02X:%02X:%02X:%02X:%02X\n";
+  const char* line2 = "[rx] console: m = MAC, s = status, g = start USB stream, x = stop\n";
+  Serial0.printf(line1, WIFI_SSID, d[0],d[1],d[2],d[3],d[4],d[5]);
+  Serial0.print(line2);
+  Serial.printf(line1, WIFI_SSID, d[0],d[1],d[2],d[3],d[4],d[5]);  // no-op if no host
+  Serial.print(line2);
+}
 
 void setup() {
-  Serial.begin(115200);
+  // USB CDC carries the binary frame stream to the host (or a console until
+  // the host asks for the stream with 'g').
+  Serial.begin((uint32_t)USB_BAUD);
+  // Hardware UART (GPIO21/20) mirrors diagnostics in every mode.
+  Serial0.begin(115200);
+  latestMutex = xSemaphoreCreateMutex();   // guards latestBuf (onRecv vs pump)
   delay(300);
+
+  // Give an already-open monitor a moment to attach (assert DTR) so the boot
+  // banner is not silently dropped by TinyUSB.
+  for (uint32_t t0 = millis(); !Serial && millis() - t0 < 2000; ) delay(50);
+
+  consoleHello();
+  usbConnected = (bool)Serial;
+  Serial0.println("[rx] joining WiFi...");
+  if (Serial) Serial.println("[rx] joining WiFi...");
 
   // STA on the S3 AP keeps both on the same WiFi channel -> ESP-NOW works.
   WiFi.mode(WIFI_STA);
   WiFi.config(CLIENT_IPADDR, AP_IPADDR, CLIENT_NETMASK);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) { delay(200); Serial.print('.'); }
-  Serial.println();
-  Serial.printf("[rx] connected to %s, ip %s\n", WIFI_SSID, WiFi.localIP().toString().c_str());
-  uint8_t d[6]; WiFi.macAddress(d);
-  Serial.printf("[rx] my MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
-                d[0],d[1],d[2],d[3],d[4],d[5]);
+  uint32_t lastDot = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+    // Progress + late monitor attach are visible on BOTH ports.
+    if (millis() - lastDot > 1000) {
+      lastDot = millis();
+      Serial0.print('.');
+      if (Serial) Serial.print('.');
+    }
+    if (!usbConnected && Serial) { usbConnected = true; consoleHello(); }
+  }
+  Serial0.println();
+  if (Serial) Serial.println();
+  const char* conn = "[rx] connected to %s, ip %s\n";
+  Serial0.printf(conn, WIFI_SSID, WiFi.localIP().toString().c_str());
+  Serial.printf(conn, WIFI_SSID, WiFi.localIP().toString().c_str());
+
+  Serial0.println("[rx] connected - ESP-NOW RX: disabling modem power-save (needed for reliable ESP-NOW while STA-connected)");
+  if (Serial) Serial.println("[rx] connected - ESP-NOW RX: disabling modem power-save");
+  WiFi.setSleep(false);   // STA power-save can silently drop ESP-NOW datagrams
 
   esp_now_init();
   esp_now_register_recv_cb(&onRecv);
 
-  srv = WiFiServer(SERVER_PORT);
-  srv.begin();
-  Serial.printf("[rx] MJPEG at http://%s/stream\n", WiFi.localIP().toString().c_str());
-}
-
-void handleHttp() {
-  WiFiClient c = srv.available();
-  if (!c) return;
-  String line = c.readStringUntil('\n');
-  line.trim();
-
-  if (line.startsWith("GET /stream")) {
-    c.setNoDelay(true);
-    c.write("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; "
-            "boundary=frame\r\nCache-Control: no-cache\r\n\r\n");
-    while (c.connected()) {
-      if (latestLen) {
-        char hdr[64];
-        int n = snprintf(hdr, sizeof(hdr),
-              "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-              (unsigned)latestLen);
-        c.write((const uint8_t*)hdr, n);
-        c.write(latestBuf, latestLen);
-        c.write((uint8_t*)"\r\n", 1);
-      } else {
-        delay(5);
-      }
-      delay(40);  // throttle display updates a little
-    }
-    c.stop();
-  } else {
-    c.write("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
-    c.write((const uint8_t*)INDEX_HTML, sizeof(INDEX_HTML) - 1);
-    c.stop();
-  }
+  // Broadcast peer for the control back-channel (quality change requests to
+  // the S3 sender: payload 'Q' + level). The sender's recv callback accepts
+  // from any MAC, so a broadcast peer is all we need.
+  esp_now_peer_info_t bcast;
+  memset(&bcast, 0, sizeof(bcast));
+  for (int i = 0; i < 6; ++i) bcast.peer_addr[i] = 0xFF;
+  bcast.channel = (uint8_t)WIFI_CHANNEL;
+  bcast.ifidx   = WIFI_IF_STA;
+  bcast.encrypt = false;
+  if (esp_now_add_peer(&bcast) != ESP_OK)
+    Serial0.println("[rx] broadcast peer add FAILED (quality relay disabled)");
+  Serial0.println("[rx] ready - waiting for ESP-NOW frames from the S3");
+  if (Serial) Serial.println("[rx] ready - waiting for ESP-NOW frames from the S3");
 }
 
 void loop() {
   checkAssembleTimeout();
-  if (Serial.available()) {
-    char ch = Serial.read();
-    if (ch == 'm') {
-      uint8_t d[6]; WiFi.macAddress(d);
-      Serial.printf("MAC %02X:%02X:%02X:%02X:%02X:%02X IP %s\n",
-                    d[0],d[1],d[2],d[3],d[4],d[5], WiFi.localIP().toString().c_str());
-    } else if (ch == 's') {
-      Serial.printf("latest frame #%u len %u\n", latestFrameId, (unsigned)latestLen);
+
+  // WiFi watchdog: if the S3's AP drops (S3 reboot / out of range) the STA
+  // must re-associate, or the ESP-NOW receive side goes silently deaf (the
+  // radio can end up scanning on the wrong channel). Reconnect aggressively.
+  if (WiFi.status() != WL_CONNECTED) {
+    static uint32_t lastAttempt = 0;
+    if (millis() - lastAttempt > 2000) {
+      lastAttempt = millis();
+      if (!wifiDownLogged) {
+        wifiDownLogged = true;
+        Serial0.println("[rx] WiFi lost - reconnecting...");
+        if (Serial && !usbStreaming) Serial.println("[rx] WiFi lost - reconnecting...");
+      }
+      WiFi.reconnect();
     }
+  } else {
+    downLoggedReset();   // re-arm the "WiFi lost" log for the next outage
   }
-  handleHttp();
+
+  // Track USB attach/detach. On every FRESH attach we greet (banner + MAC) so
+  // a monitor opened at any time - or the host viewer - gets readable proof of
+  // which board/port it is on. TinyUSB had silently dropped earlier writes.
+  bool connected = (bool)Serial;
+  if (usbConnected && !connected) {
+    usbConnected = false;
+    usbStreaming = false;   // host gone -> back to the readable console
+    outState = 0;
+    Serial0.println("[rx] USB host gone -> CONSOLE mode");
+  } else if (connected && !usbConnected && !usbStreaming) {
+    usbConnected = true;
+    consoleHello();
+  }
+
+  pumpUsb();
+  pumpUsbAudio();
+  handleSerialInput();
+
+  // Streaming but the air side is silent? Tell the user where to look. Safe
+  // to print on USB: the pump only writes binary while latestLen is non-zero,
+  // so with no frames in flight the port is idle (no torn frames possible).
+  static uint32_t lastIdleHint = 0;
+  if (usbStreaming && !latestLen && millis() - lastIdleHint > 5000) {
+    lastIdleHint = millis();
+    const char* msg = (rxFrames == 0)
+      ? "[rx] streaming, but NO ESP-NOW frames yet - is the S3 sender up?\n"
+        "[rx]   - does the S3 console print '[espnow] sending to <MAC>' at boot?\n"
+        "[rx]   - is ESPNOW_PEER_MAC in src/config.h set to THIS C3's MAC (see banner above)?\n"
+      : "[rx] streaming, frames were received but none is in flight right now\n";
+    Serial0.print(msg);
+    if (!usbStreaming)   // never write console text into the binary USB stream
+      Serial.print(msg);
+  }
 }

@@ -11,7 +11,6 @@
 #define AP_IPADDR         IPAddress(192, 168, 4, 1)   // gateway
 #define CLIENT_NETMASK    IPAddress(255, 255, 255, 0)
 
-#define SERVER_PORT           80
 #define WIFI_CHANNEL          1          // must match the sender
 
 // --- ESP-NOW framing (MUST match sender's config.h) --------------------------
@@ -22,12 +21,47 @@
 // Incoming frame buffer cap. The C3 has NO PSRAM, so keep this modest.
 #define RECEIVER_MAX_FRAME_BYTES  (32UL * 1024)
 
+// Air magic for audio datagrams (MUST match AUDIO_MAGIC in src/config.h).
+#define AUDIO_AIR_MAGIC  0xA3A5
+
 // Max time we keep assembling a frame before giving up (auto-skip stale).
 #define FRAME_ASSEMBLE_TIMEOUT_MS  200UL
+
+// ---------------------------------------------------------------------------
+// USB CDC output framing (wired link to the host viewer).
+// MUST stay in sync with host/c3_usb_mjpeg.py (the C constants mirror the
+// Python HEADER_SIZE / MAGIC_* below). This is a NEW format that only the
+// host understands - it has nothing to do with the ESP-NOW air framing above.
+//
+// Each reassembled JPEG frame is emitted on Serial (USB CDC) as:
+//
+//     [0]     magic high  = USB_MAGIC_HI
+//     [1]     magic low   = USB_MAGIC_LO
+//     [2..5]  payload byte length (big-endian uint32)
+//     [6..7]  frame id (big-endian uint16)
+//     [8..11] CRC-32 (ISO-HDLC / zlib polynomial, big-endian) of the payload
+//     [..]    payload  (the JPEG bytes)
+//
+// Length-prefixed + CRC, so the host can resync by scanning for the magic
+// when a frame is dropped mid-stream (slow host or a lost ESP-NOW segment).
+// ---------------------------------------------------------------------------
+#define USB_MAGIC_HI     (0xC3u)
+#define USB_MAGIC_LO     (0x8Cu)
+#define USB_HEADER_BYTES 12U          // magic(2) + length(4) + frame id(2) + crc32(4)
+#define USB_BAUD         115200UL     // nominal baud (USB-CDC ignores baud; kept for the host/monitor)
 
 // Optional NACK back-channel: tell the sender which frame we failed to complete
 // so it can downscale faster. Requires ESPNOW_USE_NACK=1 on the sender too.
 #define ENABLE_ESPNOW_NACK  0
+
+// --- Audio (PDM mic stream from the sender) ----------------------------------
+// Air audio datagram: [0xA3 0xA5][seq:2BE] + PCM bytes (8 kHz unsigned 8-bit).
+// Forwarded over USB with the SAME 12-byte header framing as video but with
+// AUDIO magic so the host can tell the streams apart. MUST stay in sync with
+// host/c3_usb_mjpeg.py (USB_AUDIO_MAGIC) and src/config.h (AUDIO_MAGIC).
+#define USB_AUDIO_MAGIC_HI  (0xC3u)
+#define USB_AUDIO_MAGIC_LO  (0x8Du)
+#define AUDIO_FIFO_BYTES    (8UL * 1024)   // ~1 s of 8 kHz PCM; overflow = drop
 
 // Sender MAC (only needed for NACK replies)
 #define SENDER_MAC  { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }

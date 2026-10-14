@@ -1,6 +1,7 @@
 // camera_hal.cpp - implementation of the quality/capture/adaptive engine.
 #include "camera_hal.h"
 #include "camera_pins.h"     // pin macros (PWDN_GPIO_NUM, SIOD_GPIO_NUM, ...)
+#include "camera_debug.h"    // gated boot / camera diagnostics (see DEBUG_CAMERA)
 #include <Arduino.h>
 
 // ---- Profile table (order matters: LOW..HIGH = 0..2) -----------------------
@@ -35,12 +36,12 @@ camera_config_t cameraConfigFor(QualityProfile p) {
   c.pin_href     = HREF_GPIO_NUM;
   c.pin_pclk     = PCLK_GPIO_NUM;
 
-  c.xclk_freq_hz = 20000000;          // 20 MHz sensor clock (safe on S3)
+  c.xclk_freq_hz = CAMERA_XCLK_HZ;    // sensor clock (see config.h)
   c.ledc_timer   = LEDC_TIMER_0;
   c.ledc_channel = LEDC_CHANNEL_0;
   c.pixel_format = PIXFORMAT_JPEG;    // streaming
   c.frame_size   = p.frame_size;
-  c.fb_location  = CAMERA_FB_IN_PSRAM; // 8 MB PSRAM on the XIAO S3 Sense
+  c.fb_location  = CAMERA_FB_LOCATION; // PSRAM (default) or internal DRAM
   c.jpeg_quality = p.jpeg_quality;
   c.fb_count     = 1;
   c.grab_mode    = CAMERA_GRAB_LATEST; // always most recent frame
@@ -50,13 +51,16 @@ camera_config_t cameraConfigFor(QualityProfile p) {
 bool cameraBegin() {
   QualityProfile p = qualityProfileFor(QUALITY_DEFAULT);
   camera_config_t cfg = cameraConfigFor(p);
-  if (esp_camera_init(&cfg) != ESP_OK) {
+  esp_err_t err = esp_camera_init(&cfg);
+  debugPrintInitResult("cam", err);
+  if (err != ESP_OK) {
     Serial.println("[cam] init FAILED");
     return false;
   }
   cameraApplyQuality(p.level); // explicit, so HW is in a known state
   Serial.printf("[cam] %s @ %dx%d quality=%d\n",
                 p.name, p.frame_width, p.frame_height, p.jpeg_quality);
+  debugPrintSensorProbe();     // SCCB identity + one capture probe (DEBUG_CAMERA)
   return true;
 }
 
@@ -73,11 +77,16 @@ void cameraApplyQuality(QualityLevel level) {
 
 camera_fb_t* cameraCapture() {
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) return nullptr;
-  if (fb->len == 0) {              // empty / invalid frame
-    esp_camera_fb_return(fb);
+  if (!fb) {                       // driver produced nothing
+    debugNoteCaptureFailure("capture");
     return nullptr;
   }
+  if (fb->len == 0) {              // empty / invalid frame
+    esp_camera_fb_return(fb);
+    debugNoteCaptureFailure("capture");
+    return nullptr;
+  }
+  debugCheckFrame(fb, "capture");  // warns on non-JPEG, per-frame at DEBUG_CAMERA>=2
   return fb;
 }
 
@@ -92,12 +101,15 @@ bool cameraReinit(QualityLevel level) {
   camera_config_t cfg = cameraConfigFor(p);
   esp_camera_deinit();
   delay(20);
-  if (esp_camera_init(&cfg) != ESP_OK) {
+  esp_err_t err = esp_camera_init(&cfg);
+  debugPrintInitResult("cam", err);
+  if (err != ESP_OK) {
     Serial.println("[cam] reinit FAILED");
     return false;
   }
   cameraApplyQuality(level);
   Serial.printf("[cam] reinit at %s\n", p.name);
+  debugPrintSensorProbe();     // re-verify the sensor survived the reinit
   return true;
 }
 
@@ -112,7 +124,11 @@ static const float aq_up   = ADAPTIVE_UP_THRESHOLD;
 
 void adaptiveReset() {
   aq_head = aq_count = 0;
-  for (int i = 0; i < ADAPTIVE_WINDOW; ++i) aq_window[i] = true;
+  // Start PESSIMISTIC: assume the worst until proven otherwise. Pre-filling the
+  // window with "successes" made the up-stepper march straight to HIGH (UXGA)
+  // right after every quality change - frames too big for the receiver and a
+  // known crasher. Real link results fill the window within a few frames.
+  for (int i = 0; i < ADAPTIVE_WINDOW; ++i) aq_window[i] = false;
 }
 
 static float adaptiveRatio() {

@@ -30,7 +30,21 @@
 //   q0 = LOW    (QVGA 320x240 - tiny frames, high frame rate)
 //   q1 = MEDIUM (VGA 640x480 - balanced)                <-- default
 //   q2 = HIGH   (UXGA 1600x1200 - detailed, lower frame rate)
-#define QUALITY_DEFAULT  QUALITY_MEDIUM
+#define QUALITY_DEFAULT  QUALITY_LOW
+
+// Camera XCLK (master clock) in Hz. 20 MHz is the Seeed default. If a module
+// initialises (SCCB ID reads correctly) but NEVER returns a frame, the parallel
+// data bus may be marginal - trying 16 MHz (also enables EDMA mode on the S3)
+// or 10 MHz sometimes revives a flaky module. The serial 't' command sweeps
+// these automatically (see DEBUG_CAMERA).
+#define CAMERA_XCLK_HZ   16000000
+
+// Frame-buffer location. CAMERA_FB_IN_PSRAM (default) uses the 8 MB PSRAM
+// (EDMA path). If a module initialises and its SCCB ID reads fine but it only
+// delivers frames when the buffer lives in internal RAM, switch this to
+// CAMERA_FB_IN_DRAM - some marginal sensors/boards fail on the PSRAM path only.
+// NOTE: internal RAM is limited; keep QUALITY_DEFAULT at LOW/MED if you use DRAM.
+#define CAMERA_FB_LOCATION  CAMERA_FB_IN_PSRAM
 
 // ---------------------------------------------------------------------------
 // 3) WiFi access point (this board acts as an AP for both targets)
@@ -78,13 +92,13 @@
 #define NOW_PAYLOAD_BYTES   (ESPNOW_MAX_PAYLOAD - NOW_HEADER_BYTES)  // 240
 
 // Retransmission / error tolerance (per segment).
-#define ESPNOW_SEND_RETRIES      3        // attempts per segment
-#define ESPNOW_RETRY_DELAY_MS    2        // pause between retries
+#define ESPNOW_SEND_RETRIES      2        // attempts per segment (latency: 3 x wait hurts)
+#define ESPNOW_RETRY_DELAY_MS    1        // pause between retries
 
 // MAC address of the ESP32-C3 dish receiver (fill in YOUR receiver's MAC).
 // If left 0xFF it is ignored and the C3's address is shown on its serial monitor.
 // See the receiver build for how to read it.
-#define ESPNOW_PEER_MAC  { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
+#define ESPNOW_PEER_MAC  { 0xE8, 0xF6, 0x0A, 0x17, 0x55, 0xBC }
 
 // If you set this to 1 and enable ENABLE_ESPNOW_NACK in the receiver, the
 // receiver will reply with the frame-id of incomplete frames so the sender can
@@ -97,3 +111,45 @@
 #define ADAPTIVE_DOWN_THRESHOLD   0.60f   // ratio of failures that triggers a step down
 #define ADAPTIVE_UP_THRESHOLD     0.15f   // ratio below which we step back up
 #define ADAPTIVE_WINDOW           64      // samples in the sliding window
+
+// Ceiling for the adaptive up-stepper on the ESP-NOW target. HIGH (UXGA) frames
+// are ~160 KB - far beyond what the C3 can receive (32 KB, no PSRAM) - and
+// UXGA capture has been observed to crash the S3. MEDIUM is the practical max.
+#define ESPNOW_MAX_QUALITY  QUALITY_MEDIUM
+
+// ---------------------------------------------------------------------------
+// 6) Microphone (PDM mic on the XIAO S3 Sense expansion board)
+//    16 kHz captured, decimated to 8 kHz, 8-bit unsigned PCM = 8 KB/s, which
+//    fits in the spare ESP-NOW airtime next to the video segments.
+//    NOTE: if you hear silence but no errors, swap the two pins - board
+//    revisions have used both orientations.
+// ---------------------------------------------------------------------------
+#define ENABLE_MIC             1
+#define MIC_CLK_GPIO           42         // PDM clock  (ws_io_num)
+#define MIC_DATA_GPIO          41         // PDM data   (data_in_num)
+#define MIC_CAPTURE_RATE       16000      // I2S PDM capture rate (Hz)
+#define MIC_STREAM_RATE        8000       // after 2:1 decimation (Hz)
+#define MIC_CHUNK_BYTES        240        // one ESP-NOW audio datagram = 30 ms
+
+// ---------------------------------------------------------------------------
+// 7) DEBUG FLAG - bring-up / camera diagnostics
+// ---------------------------------------------------------------------------
+// <-- FLIP THIS when a camera (or the whole board) looks dead. It is the switch
+//     that turns a silent black stream into a readable diagnosis on Serial.
+//
+//   0 = quiet production build (all diagnostics compiled out)
+//   1 = boot dump + one-shot camera self-test:
+//         reset reason, chip/flash/heap/PSRAM, the GPIO->camera pin map, the
+//         esp_camera_init() result code, the sensor's SCCB identity (PID / part
+//         name) and a live capture probe.
+//   2 = everything in 1, PLUS a one-line summary for EVERY captured frame.
+//
+// Why this exists: a bad camera module almost always fails on the SCCB bus -
+// esp_camera_init() returns ESP_ERR_CAMERA_NOT_DETECTED (0x20001) and/or the
+// sensor PID reads 0x00 / 0xFF because nothing answers. That is a hardware
+// (module / ribbon) fault, not firmware - swapping the module fixes it. This
+// flag prints exactly that instead of leaving you guessing.
+//
+// The same dump is available on demand: type 'd' in the serial monitor.
+#define DEBUG_CAMERA  1
+

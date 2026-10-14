@@ -7,9 +7,12 @@
 // Serial commands (both targets):
 //   q0 / q1 / q2  -> switch quality LOW / MEDIUM / HIGH
 //   s             -> print status
+//   d             -> dump boot + camera diagnostics (see DEBUG_CAMERA in config.h)
+//   t             -> camera bus sweep (try every XCLK/fb mode for a frame)
 #include <Arduino.h>
 #include "config.h"
 #include "camera_hal.h"
+#include "camera_debug.h"    // gated boot / camera diagnostics (see DEBUG_CAMERA)
 
 #if (STREAM_TARGET == STREAM_TARGET_BROWSER)
   #include "stream_browser.h"
@@ -28,6 +31,9 @@ static void printBanner() {
   Serial.println("ESP32-C3 (dish receiver over ESP-NOW)");
 #endif
   Serial.println(" quality: q0/q1/q2 (LOW/MED/HIGH) | s = status");
+#if DEBUG_CAMERA >= 1
+  Serial.println(" debug  : d = dump diagnostics, t = camera bus sweep");
+#endif
   Serial.println("----------------------------------------------\n");
 }
 
@@ -36,6 +42,9 @@ void statusReport() {
   (void)p;
   Serial.printf("[main] quality default index = %d\n", QUALITY_DEFAULT);
   Serial.printf("[main] free heap = %u B\n", (unsigned)ESP.getFreeHeap());
+#if DEBUG_CAMERA >= 1
+  Serial.printf("[main] capture failures = %u\n", (unsigned)debugCaptureFailures());
+#endif
 }
 
 void setup() {
@@ -43,8 +52,19 @@ void setup() {
   delay(300);
   printBanner();
 
+#if DEBUG_CAMERA >= 1
+  // Print board facts + the pin map BEFORE touching the camera, so an init
+  // failure is read in context (a BROWNOUT reset here also mimics a dead cam).
+  debugPrintBootInfo();
+  debugPrintPinMap();
+#endif
+
   if (!cameraBegin()) {
     Serial.println("[main] FATAL: camera did not initialise. Check the sensor.");
+#if DEBUG_CAMERA >= 1
+    Serial.println("[main] a bad module/ribbon reports ESP_ERR_CAMERA_NOT_DETECTED "
+                   "(0x20001) - see the [dbg] lines above; try 'd' to re-dump.");
+#endif
   }
 
 #if (STREAM_TARGET == STREAM_TARGET_BROWSER)
@@ -57,10 +77,12 @@ void setup() {
 }
 
 void loop() {
-  // Process a serial status query cheaply.
+  // Process a serial status/debug query cheaply.
   while (Serial.available()) {
     char c = Serial.read();
     if (c == 's') statusReport();
+    if (c == 'd') debugDumpAll();     // full boot + camera diagnostic dump
+    if (c == 't') debugCameraBusSweep();  // search for any mode that frames
   }
 
 #if (STREAM_TARGET == STREAM_TARGET_BROWSER)

@@ -27,6 +27,11 @@ typedef struct {
 // driver. Useful to boot at a chosen level.
 QualityProfile qualityProfileFor(QualityLevel level);
 
+// Build a camera_config_t for a profile (pins, XCLK=CAMERA_XCLK_HZ, PSRAM...).
+// Exposed so the diagnostics sweep can override fields (xclk/fb_location) and
+// re-init without duplicating the pin map.
+camera_config_t cameraConfigFor(QualityProfile p);
+
 // Boot the camera driver with QUALITY_DEFAULT. Returns true on success.
 bool cameraBegin();
 
