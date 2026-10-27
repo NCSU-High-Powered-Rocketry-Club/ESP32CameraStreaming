@@ -15,7 +15,7 @@
 #define STREAM_TARGET_ESP32C3  2   // Segmented ESP-NOW frames to the dish ESP32-C3
 
 // <-- CHANGE THIS ONE LINE TO PICK WHO RECEIVES THE VIDEO -->
-#define STREAM_TARGET  STREAM_TARGET_ESP32C3
+#define STREAM_TARGET STREAM_TARGET_BROWSER
 
 #if (STREAM_TARGET != STREAM_TARGET_BROWSER) && (STREAM_TARGET != STREAM_TARGET_ESP32C3)
 #error "STREAM_TARGET must be STREAM_TARGET_BROWSER or STREAM_TARGET_ESP32C3"
@@ -123,11 +123,44 @@
 // UXGA capture has been observed to crash the S3. MEDIUM is the practical max.
 #define ESPNOW_MAX_QUALITY  QUALITY_MEDIUM
 
+// FPS-priority mode (dashboard "fps" button, 'F1'/'F0'; 'f' on the S3 console).
+//   mic OFF + quality PINNED at LOW + the adaptive up-stepper blocked.
+// With the mic off the deliberate 3 fps cap in espnowPoll() no longer applies;
+// holding LOW is what keeps the freed airtime for FRAME RATE instead of letting
+// the up-stepper spend it on VGA - which measured SLOWER (2.1 fps, 30% frame
+// loss: a VGA frame is 43 segments and needs every one of them to assemble).
+// Audio is deliberately lost here; the link cannot carry both.
+// Predicted from the measured ~7.8 ms/segment send cost: 13 segments x 7.8 ms
+// = ~101 ms of airtime per LOW frame against the LOW profile's 66.7 ms slot ->
+// ~9-10 fps. The real ceiling is the per-segment ACK wait in espNowSendReliable().
+#define ESPNOW_FPS_PRIORITY_MAX_FPS  15.0f   // frame-rate target in fps mode
+#define FPS_PRIORITY_DEFAULT         0       // 1 = boot straight into fps mode
+
+// Runtime frame-rate cap ('V' + 1..60 from the dashboard, 'v<1..60>' on the S3's
+// own console). 0 = follow the profile rate and the mic rules.
+// An explicit value OUTRANKS both the profile rate and the 3 fps mic default -
+// the user asked for a number. Above ~9 fps on this link the gate stops binding
+// and airtime becomes the wall, so 60 effectively means "as fast as the link
+// allows"; with the mic on, anything over 3 starves the video (watch DROP RATE).
+#define FPS_TARGET_MIN      1
+#define FPS_TARGET_MAX      60
+#define FPS_TARGET_DEFAULT  0
+
+// An explicit quality or fps command also sets qualityManual, which holds the
+// adaptive UP-stepper off so it cannot quietly undo the user's choice - that
+// revert is invisible in flight and reads as a broken button. The DOWN-step
+// safety net still runs: if a frame's segments do not all get through, quality
+// drops rather than the stream dying. 'A' (or the F1 button) clears manual and
+// hands quality back to the adaptive controller.
+
 // ---------------------------------------------------------------------------
 // 5b) Control / status back-channel (ESP-NOW, tiny tagged datagrams)
 //     Control  (C3 -> S3, broadcast, MUST match the tags in
 //               receiver/src/receiver.cpp - keep both sides in sync):
 //       {'Q', level}                 quality 0..2  ('0'..'2')
+//       {'F', '0'|'1'}               fps-priority mode off / on     <- new
+//       {'V', fps}                   frame-rate cap, 1..60 ('V0' = auto) <- new
+//       {'A'}                        quality/rate back to AUTO (adaptive) <- new
 //       {'M'}                        toggle the PDM mic
 //       {'R', '0'|'1'}               stop / start the SD recording   <- new
 //       {'T', secHi, secLo}          max recording seconds (0 = unlimited) <- new

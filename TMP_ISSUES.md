@@ -64,12 +64,54 @@ Applied to every 30 ms chunk before `/audio.pcm` serves it. Tune with
 
 ## 3. C3 keeps falling back to console mode / mystery 'x' commands
 
-**Status: PARTIALLY ADDRESSED, NOT VERIFIED (no code change this pass).**
+**Status: ADDRESSED + VERIFIED (2026-10-16).** The REAL root cause of "sometimes
+I have to restart the host script" was not the C3 at all: the host's reader
+thread died on its own.
 
-flock-exclusive port + `g` keep-alive are in place; the known remaining test
-is a single clean host instance vs. a stray `pio device monitor`, and if it
-still reproduces, instrumenting the C3 to log WHICH port the 'x' came from
-(`Serial0` vs `Serial`). Requires hardware to verify.
+- **The bug (host/c3_usb_mjpeg.py):** any read error on the USB fd made the
+  reader close the port and try to reopen it. When that reopen failed (a
+  re-enumerating device is missing for a second or two), it `continue`d with
+  `fd = None`, and the next loop pass called `os.read(None, ...)` -> `TypeError`,
+  which escaped `run()` (only `OSError` was caught) and then raised again inside
+  `finally: os.close(None)`. The thread died silently; the HTTP server kept
+  serving a frozen page until the script was restarted. Reproduced against the
+  fake-pty harness - old code, verbatim traceback:
+  `c3_old.py:453 in run -> chunk = os.read(fd, 65536)` /
+  `TypeError: 'NoneType' object cannot be interpreted as an integer`, then
+  `c3_old.py:588 in run -> os.close(fd)`.
+- **Fix:** the reader now never gives up - failed opens retry every 1 s; a read
+  error closes the fd, backs off 0.5 s and reconnects; a gone/renamed node
+  (`ttyACM0` -> `ttyACM1`) is re-detected with the `s`-probe and adopted; an open
+  but byte-silent port is fd-cycled every `USB_SILENCE_CYCLE_S` (20 s), which is
+  the only thing that clears a wedged host-side CDC endpoint; every fd write goes
+  through `_write()` (fd-is-None and OSError are swallowed, so a control write
+  can never kill the thread); Ctrl-C now actually sends the documented `x`
+  (`SerialReader.stop()`); a locked port names the holding PID (`/proc` scan, no
+  lsof).
+- Two related host fixes fell out of the same pass: the `g` keep-alive used to
+  undo the dashboard's PAUSE within 3 s (now suppressed while paused), and a
+  bound HTTP port / a late-plugged board used to abort startup with a traceback
+  (now a clear message + the reader waits for the C3).
+- Also fixed while probing the live board: a HELD port reported
+  `[Errno 9] Bad file descriptor` instead of "port is locked". `open_serial()`
+  closed the fd twice - the second `os.close()` raised EBADF from the outer
+  handler and replaced the good `RuntimeError`, so the one message that names the
+  holding process was the one nobody ever saw.
+- **Verified:** `python3 host/test_reader_recovery.py` (58 checks, fake C3 on a
+  pty behind a symlink, no hardware) - old file: 18 failures including the dead
+  reader thread; fixed file: all pass. Live, with the S3 streaming: the real C3
+  on `/dev/ttyACM0` opens, `frames` climb, `/stream` serves real JPEG
+  (`Content-Length: 3526`, JFIF), `/status` reports `"reader":"open"`, and a
+  side-by-side run of the OLD script on the same live link gives the same
+  numbers (39 frames / 43 skips / 16.7 % drop over ~14 s) - no metric regression.
+
+The original flock + `g` keep-alive questions are unchanged; the remaining
+hardware test (single clean host instance vs. a stray `pio device monitor`) is
+still open. Separate finding from the same session: the C3 on the bench answers
+`x`/`s`/`m` with nothing but `.` - it is stuck in `setup()`'s `while (WiFi.status()
+!= WL_CONNECTED)` join loop because the S3 sender is off. Its USB console is
+therefore dead until the S3's AP exists; only then can anything be verified on
+the wire.
 
 ---
 
@@ -170,8 +212,198 @@ seated/FAT32 and watch the `[rec] mounting microSD...` lines at boot.
 
 ---
 
-## Context snapshot (updated 2026-10-13)
+## 9. Live link level (RSSI) on the dashboard — implemented; what the radio cannot give
 
+**Status: IMPLEMENTED + HOST-VERIFIED (2026-10-16); the C3 firmware needs a flash
+before the card shows anything.**
+
+- `receiver/src/receiver.cpp` -> `reportLink()` prints
+  `[rx] link rssi=<dBm> ch=<n> sta=<0|1>` (WiFi.RSSI()/channel of the S3's AP) at
+  `LINK_REPORT_PERIOD_MS` (1 s), earlier when the level moves by
+  `LINK_REPORT_MIN_DELTA` (2 dBm). Host: `LINK_LINE_RE` -> `/status` (`rssi`,
+  `rssi_ch`, `rssi_sta`, `rssi_age`) -> dashboard SIGNAL card (green > -60 dBm,
+  amber > -75, red below).
+- Frame safety: the line goes through a 4-slot USB line queue (`queueUsbLine()` /
+  `flushUsbLine()`) flushed only while the pump is BETWEEN frames
+  (`outState == 0`); the old single-slot REC mechanism was generalised into it, so
+  REC and link lines no longer fight over one buffer.
+- **Availability, checked not assumed** (installed core
+  `framework-arduinoespressif32` 4.20017.260907): `esp_now_recv_cb_t` in
+  `tools/sdk/esp32c3/include/esp_wifi/include/esp_now.h` is
+  `void (*)(const uint8_t *mac_addr, const uint8_t *data, int data_len)` - **no
+  `rx_ctrl`, so per-datagram RSSI is not reachable from the receive callback**.
+  Getting it would mean promiscuous mode + a MAC filter. Receiver **gain**
+  (AGC/LNA) is not software-readable at all on this PHY; TX power is
+  (`WiFi.getTxPower()`/`setTxPower()`, currently untouched); the S3's mic gain is
+  compile-time ×8 in `src/stream_espnow.cpp`.
+- Host verification without the flash: the harness feeds real console text
+  between frames and checks the parse + `/status` fields, and the firmware's
+  `snprintf` formats were compiled with gcc and piped through the host regexes
+  (including `rssi=-128` and `sta=0`) - all lines parse.
+- **Not verified:** the on-board RSSI value itself (needs
+  `cd receiver && pio run -t upload -e esp32c3_receiver`). Receiver build passes:
+  RAM 34.5 % (113 116 B), Flash 55.8 % (730 778 B).
+
+---
+
+## 10. "It dropped out and didn't recover" — the `g` keep-alive was dead, and the page could not re-open its stream
+
+**Status: FIXED + REPRODUCED LIVE (2026-10-16).**
+
+Two separate faults, both host-side, both invisible in the logs the user sees:
+
+1. **The keep-alive never fired again once the stream had ever worked.**
+   `run()`'s re-arm was gated on `if parser.frames:` — the parser's *cumulative*
+   frame counter, which is non-zero forever after the first frame. So every loop
+   pass refreshed `_last_g`/`_last_frame_ok`, the "no frames for 3 s" branch was
+   never entered, and no `g` was ever re-sent. The C3 falls back to CONSOLE mode
+   on any stray `x` (second host instance, `pio device monitor` exit handler, a
+   C3 USB glitch) and then needs a new `g` to stream again - it never got one, so
+   the picture stayed frozen until the script was restarted. `g_probe.py` sending
+   `g` every second streamed 70 s straight with no dropout, which is what proved
+   the C3 is not at fault.
+   **Fix:** gate on frames decoded in *this* pass (`got`), so the re-arm fires
+   every ~2 s whenever nothing is being decoded (still suppressed while PAUSEd).
+   A/B with `ka_check.py` (2 frames, then 8 s of console-only traffic):
+   old = 0 `g` bytes re-sent, fixed = 3. Live, real board: a single stray `x`
+   byte froze `frames` at 96 for 25+ s before the fix; after it, the stream was
+   moving again 2-4 s later with no intervention.
+2. **The browser never re-opened a dead MJPEG stream.** `<img src='/stream'>`
+   does not reconnect on its own, so even after frames resume the page can sit on
+   the last frame forever (independent of #1 - server restart, Wi-Fi blip, or a
+   closed connection).
+   **Fix:** page watchdog - when `/status` shows the same `seq` for 4 consecutive
+   seconds, the page re-opens `/stream` until frames move again.
+
+Evidence from the C3 itself while broken (`link_timeline.py`, sole reader):
+`latest frame #186 len 3034  espnow rx 2446  usb written 953  mode console` with
+`[rx] frame N ok (3024 B, 13 seg)` climbing - the air link and reassembly were
+perfect, only the USB forwarding was stopped (`usb written` frozen).
+
+Regression tests: `host/test_reader_recovery.py` [9] covers the keep-alive
+(68 checks total after issue #11 added 9).
+
+---
+
+## 11. "Is there any way it can be faster?" - the 3 fps cap is real, but turning the mic off makes it SLOWER
+
+**Status: DIAGNOSED + MEASURED LIVE (2026-10-16); the new FPS-priority mode is
+built and host-verified, but NOT flashed - it needs both boards, so it has never
+executed.**
+
+The question started as a HYPOTHESIS in HANDOFF.md: `src/stream_espnow.cpp:518`
+caps `p.max_fps` at 3.0 while the mic is enabled, and the observed ~3 fps matched
+that cap. The hypothesis was right about the cause and wrong about the fix.
+
+### A. The cap is real, and the mic was on (confirmed without taking the port)
+
+- Source: `src/config.h:149` `ENABLE_MIC 1`, `stream_espnow.cpp:60`
+  `micEnabled = true` at boot, `QUALITY_DEFAULT QUALITY_LOW` (profile `max_fps`
+  15.0) -> line 518 clamps it to 3.0.
+- **Live proof that needs no serial access**: `/status.bytes` is
+  `parser.bytes` = EVERY byte off the USB CDC port. Subtract the video payload
+  (`frames x avg_frame`), the 12-byte video headers and `text`, and the
+  remainder is 8402-8414 B/s. Quantised: `168305 / 252 = 667.9` datagrams over
+  20.0 s = **33.39 pkt/s** against the designed `8000/240 = 33.33` pkt/s
+  (100.17 %). Magic-scan resync garbage cannot land on a whole number of
+  252-byte datagrams at the design rate, and the 57 skips counted in that window
+  would each have to be ~2953 B long.
+- `gap_med 334 ms` = `1000/3.0` exactly, `p95 669` = 2x. A saturated
+  ACK-waiting send loop smears; exact multiples of the slot is a *gate*.
+- Toggled the mic ONCE through the viewer's own `/ctl` (never touched the port;
+  the serial probe was refused by the flock guard and wrote zero bytes):
+  residual 8387 -> 4 -> 8397 B/s. Cause confirmed on hardware.
+
+### B. Turning the mic off alone is a NET LOSS (measured 0.80x)
+
+    A mic as found   fps=2.65  gap_med=334  drop= 6.7%  avg_frame= 2915 (13 seg)
+    B mic OFF        fps=2.12  gap_med=334  drop=32.3%  avg_frame=10223 (43 seg)
+    C restored       fps=2.50  gap_med=334  drop= 0.0%  avg_frame= 2914
+
+With `micEnabled` false the block at line 622 is gone, so `adaptiveStep()`
+climbs LOW -> MEDIUM. `cameraApplyQuality()` calls `adaptiveReset()`, and
+`adaptiveStep()` fires once `aq_count >= 8`; at ~39 segment reports/s that is
+**~0.2 s**. `avg_frame` 2915 -> 10223 = 3.5x the bytes, and a 43-segment frame
+needs every segment to assemble -> 32.3 % frame loss. A mic-off S3 therefore
+sits at VGA and is SLOWER than mic-on LOW.
+
+### C. LOW cannot be held from the dashboard either
+
+13 x `'0'` over 26 s left `avg_frame` at 10347. The relay path is NOT at fault
+(checked in source: the C3 sends `{'Q', ch}` and the S3 wants `{'Q', '0'..'2'}` -
+they match). The climb simply needs only 8 reports (~0.2 s), so any button or
+script interval is ~10x too slow, and `ESPNOW_MAX_QUALITY = QUALITY_MEDIUM` is
+where a mic-off sender always ends up.
+
+### D. The real ceiling: ~7.8 ms per ACK-waited segment
+
+Derived two independent ways and consistent: LOW = 13 seg -> ~101 ms of airtime
+(the 334 ms gate binds); MEDIUM = 43 seg -> ~335 ms (airtime binds and *lands on*
+the same 334 ms). That is why `gap_med` never moved across all three phases -
+two different limiters printing the same number, which is exactly what made the
+mic-only theory look airtight.
+
+Consequence: with the mic off AND LOW actually held, the 66.7 ms gate stops
+binding and airtime permits **~9-10 fps** (13 x 7.8 ms = 101 ms). Still a model
+prediction - see the verification note below.
+
+### E. The fix: FPS-priority mode (`'F1'` / `'F0'`)
+
+mic OFF + quality PINNED at LOW + the up-stepper blocked, so the freed airtime
+goes to frame rate. An **idempotent SET, deliberately not a toggle** - ESP-NOW
+broadcasts are not ACKed, and the `'M'` mic toggle's even-delivery desync is
+exactly the trap being avoided here.
+
+`dashboard [fps] -> /ctl?cmd=F1 -> C3 handleCommand('F') + readDecArg ->
+relayToSender({'F','1'}, re-sent 3x) -> S3 espNowOnRecv -> setFpsPriority(true)`.
+
+- `src/config.h`: `ESPNOW_FPS_PRIORITY_MAX_FPS` (15.0), `FPS_PRIORITY_DEFAULT`.
+- `src/stream_espnow.cpp`: `fpsPriority` state, the `'F'` receive branch,
+  `setFpsPriority()`, the poll-side pin + `max_fps` override + up-stepper block,
+  and `'f'` on the S3's own console for bench work.
+- `receiver/src/receiver_config.h` / `receiver.cpp`: `FPS_CTRL_TAG_F`, the relay
+  branch, the console banner.
+- `host/c3_usb_mjpeg.py`: `/ctl` accepts `F[01]`, `/status` carries `fps_mode`,
+  the `[fps]` dashboard button.
+- Drops audio by design: the link cannot carry both (that is why the mic cap
+  exists at all).
+
+### F. Verified / not verified
+
+**Verified.** Both builds clean: S3 RAM 15.6 % / Flash 25.4 %; C3 RAM 34.5 % /
+Flash 55.8 % (730 996 B, +218 B = the new relay branch).
+`host/test_reader_recovery.py` reports **68 checks, 0 failures**, including 9 new
+ones: `/ctl?cmd=F1|F0` accepted and relayed, `/status fps_mode` 1 then 0, and
+`F9` / `F` / `F1x` / `f1` all rejected. The live viewer was untouched throughout
+(0 reconnects, 0 errors); the change is confirmed NOT live by the running
+viewer's `/status` having no `fps_mode` key.
+
+**Not verified.** The firmware behaviour itself. Neither board carries this
+build, so `setFpsPriority()`, the LOW pin and the `max_fps` override have never
+run, and **~9-10 fps remains a prediction, not a measurement**. First on-bench
+check: with fps mode on, `avg_frame` should sit at ~2900 and `fps_mode` should
+read 1; if the S3 ever reports ~10300 with fps mode on, the pin lost the race and
+the climb is faster than measured here.
+
+**Next lever if more is wanted.** The ~7.8 ms/segment is mostly the ACK wait plus
+retries (2 attempts, 30 ms timeout each). A straight port of the audio path's
+fire-and-forget trick to video is NOT safe: at 13 segments a 10 % per-segment
+loss leaves only `0.9^13 = 25 %` of frames assembling. Lossy video needs FEC or
+fewer segments covering the frame, not fewer retries.
+
+---
+
+## Context snapshot (updated 2026-10-16)
+
+- 2026-10-16: host viewer made self-healing (reader thread no longer dies - that
+  was the "restart it" bug, issue #3), the `g` keep-alive actually re-arms the C3
+  again (issue #10), live link RSSI on the dashboard (issue #9), regression
+  harness `host/test_reader_recovery.py` (68 checks, no hardware).
+- 2026-10-16 (later): the "can it be faster" question answered by measurement -
+  issue #11. The 3 fps cap IS the mic (confirmed live via the USB byte residual),
+  but turning the mic off makes it SLOWER (0.80x: the up-stepper spends the freed
+  airtime on VGA). New FPS-priority mode (`'F1'`/`'F0'`) pins LOW + mic-off
+  instead; built and host-verified, NOT yet flashed.
 - Video S3→C3→USB→dashboard works; C3 reassembles 8–14 KB frames reliably.
 - Audio chain end-to-end; host serves `/audio.pcm`, dashboard plays it live
   via Web Audio (issue #1 fix). Audio air cost reduced (lossy send + 5 fps

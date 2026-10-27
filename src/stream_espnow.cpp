@@ -46,6 +46,17 @@ static uint32_t txSendErr = 0;       // esp_now_send() API errors
 static volatile bool recordStartRequest = false;
 static volatile bool recordStopRequest  = false;
 
+// FPS-priority mode ('F1'/'F0' from the dashboard, or 'f' on the S3's own
+// console): mic OFF + quality pinned LOW + the adaptive up-stepper blocked.
+// See ESPNOW_FPS_PRIORITY_MAX_FPS in config.h for why PINNING LOW - and not
+// merely turning the mic off - is what actually buys frame rate.
+static volatile bool fpsPriority = FPS_PRIORITY_DEFAULT;
+
+// Explicit frame-rate cap ('V'), 0 = follow the profile rate + mic rules, and
+// the "the user has chosen" flag that keeps the up-stepper from undoing it.
+static volatile int  targetFps     = FPS_TARGET_DEFAULT;
+static volatile bool qualityManual = false;
+
 // ---------------------------------------------------------------------------
 // Microphone capture (PDM) - capture in a background task into a ring buffer;
 // the ACTUAL ESP-NOW audio sends happen here in the loop task (inside
@@ -177,13 +188,37 @@ void espNowOnSend(const uint8_t* mac, esp_now_send_status_t status) {
 // Payload: 'Q' + level ('0'..'2'). One-way video, narrow-band control.
 // ---------------------------------------------------------------------------
 static void setQuality(QualityLevel l);   // defined below
+static void setFpsPriority(bool on);      // defined below (calls setQuality)
 void espNowOnRecv(const uint8_t* mac, const uint8_t* data, int len) {
   if (len >= 2 && data[0] == 'Q' && data[1] >= '0' && data[1] <= '2') {
     int lv = data[1] - '0';
+    qualityManual = true;      // explicit choice: hold the auto up-stepper off
     if (lv != (int)current) {
       Serial.printf("[espnow] remote quality -> %d\n", lv);
       setQuality((QualityLevel)lv);
     }
+  }
+  else if (len >= 2 && data[0] == 'F' && (data[1] == '0' || data[1] == '1')) {
+    // Dashboard fps button. An idempotent SET, never a toggle: ESP-NOW
+    // broadcasts are not ACKed, so the C3 re-sends this and a lost datagram
+    // must not desync the mode (exactly the bug the mic 'M' toggle has).
+    setFpsPriority(data[1] == '1');
+  }
+  else if (len >= 2 && data[0] == 'V') {
+    // Dashboard frame-rate cap. Idempotent SET (re-sent by the C3).
+    int v = (int)data[1];
+    if (v >= FPS_TARGET_MIN && v <= FPS_TARGET_MAX) {
+      targetFps = v;
+      qualityManual = true;
+      Serial.printf("[espnow] fps target -> %d\n", v);
+    }
+  }
+  else if (len >= 1 && data[0] == 'A') {
+    // Dashboard AUTO: drop the manual pin and let the adaptive controller run
+    // quality AND rate again (same effect as the F1 button re-pinning LOW).
+    qualityManual = false;
+    targetFps = FPS_TARGET_DEFAULT;
+    Serial.println("[espnow] quality AUTO (adaptive)");
   }
 #if ENABLE_MIC
   else if (len >= 1 && data[0] == 'M') {          // toggle mic from dashboard
@@ -399,6 +434,23 @@ static void setQuality(QualityLevel l) {
   cameraApplyQuality(l);
 }
 
+// Dashboard "fps" mode: mic OFF, quality pinned LOW, up-stepper blocked.
+// Shared by the ESP-NOW 'F1'/'F0' control and the S3 console's 'f' key.
+static void setFpsPriority(bool on) {
+  fpsPriority = on;
+  if (!on) { Serial.println("[espnow] fps priority OFF"); return; }
+  // fps mode re-asserts its own LOW pin, so drop any previous manual pin.
+  qualityManual = false;
+#if ENABLE_MIC
+  // Audio and a high frame rate do not both fit on this link: the 3 fps mic
+  // cap is deliberate, so fps mode gives the microphone up.
+  micEnabled = false;
+#endif
+  // Pin LOW now; the up-stepper would otherwise spend the freed airtime on VGA.
+  setQuality(QUALITY_LOW);
+  Serial.println("[espnow] fps priority ON (mic off, quality pinned LOW)");
+}
+
 void espnowHandleSerialQ() {
   while (Serial.available()) {
     char ch = Serial.read();
@@ -414,9 +466,30 @@ void espnowHandleSerialQ() {
 // only for API compatibility).
 //   q0/q1/q2   quality      r  start recording      e  stop recording
 //   D<secs>    max clip length (0 = unlimited)      P<0..2>  priority
+//   f          fps-priority mode (mic off, LOW pinned, up-stepper blocked)
+//   v<1..60>   frame-rate cap (explicit; overrides profile rate + mic default)
 // Returns true when the char was consumed.
 // ---------------------------------------------------------------------------
 bool espnowHandleSerialKey(char ch) {
+  if (ch == 'f') { setFpsPriority(!fpsPriority); return true; }
+  if (ch == 'v') {                       // frame-rate cap, same as the 'V' SET
+    delay(5);
+    int v = 0, n = 0;
+    while (Serial.available() && n < 2) {
+      char d = (char)Serial.peek();
+      if (d < '0' || d > '9') break;
+      Serial.read();
+      v = v * 10 + (d - '0');
+      ++n;
+    }
+    if (v >= FPS_TARGET_MIN && v <= FPS_TARGET_MAX) {
+      targetFps = v; qualityManual = true;
+      Serial.printf("[espnow] fps target %d\n", v);
+    } else {
+      Serial.println("[espnow] usage: v<1..60>");
+    }
+    return true;
+  }
   if (ch == 'q') {
     delay(5);
     if (Serial.available()) {
@@ -517,6 +590,19 @@ void espnowPoll() {
   // drop rate). Fewer, smaller frames leave real airtime gaps for audio.
   if (micEnabled && p.max_fps > 3.0f) p.max_fps = 3.0f;
 #endif
+  // fps mode pins LOW only for as long as the user has NOT picked a quality of
+  // their own. The pin is what makes fps mode fast (a mic-off sender otherwise
+  // climbs to VGA and gets SLOWER), but re-asserting it over an explicit choice
+  // reverted MEDIUM every pass - invisible in flight and read as a broken
+  // button. qualityManual is set by '0'/'1'/'2'/'V', so from then on the user's
+  // choice wins.
+  if (fpsPriority && !qualityManual && current != QUALITY_LOW) {
+    setQuality(QUALITY_LOW);
+  }
+  if (fpsPriority && targetFps <= 0) p.max_fps = ESPNOW_FPS_PRIORITY_MAX_FPS;
+  // An explicit 'V' outranks the profile rate and the 3 fps mic default: the
+  // user asked for a number. See FPS_TARGET_MIN/MAX in config.h.
+  if (targetFps > 0) p.max_fps = (float)targetFps;
   if (!fpsGate(p.max_fps)) { delay(2); return; }
 
   camera_fb_t* fb = cameraCapture();
@@ -621,5 +707,9 @@ void espnowPoll() {
   // up - more bytes/frame is exactly what saturated the link before.
   if (micEnabled && next > QUALITY_LOW) next = -1;
 #endif
+  // ...and under any explicit intent: fps mode, or a quality/rate the user set
+  // themselves. Climbing to VGA is precisely what makes the mic-off case
+  // SLOWER (43 segments/frame) instead of faster.
+  if ((fpsPriority || qualityManual) && next > QUALITY_LOW) next = -1;
   if (next >= 0) setQuality((QualityLevel)next);
 }

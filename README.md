@@ -40,6 +40,8 @@ S3 (airborne) --ESP-NOW--> C3 dish --USB CDC (wired)--> host (Pi/laptop)
     └── c3_usb_mjpeg.py     #   opens the C3 USB CDC port, CRC-validates,
                             #   re-serves MJPEG at http://<host>:8080/ and has
                             #   the dashboard controls (quality, mic, SD recording)
+    └── test_reader_recovery.py  # regression test: reader must survive unplug /
+                            #   port rename / dead fd (pty fake, no hardware)
 ```
 
 > The receiver is a **separate nested sub-project** because PlatformIO has no
@@ -134,6 +136,19 @@ The same page also drives the **sender's microSD recorder** (`r` / `e` / `t<secs
 / `p<0..2>`, relayed to the S3 over ESP-NOW) and shows the recording state the S3
 reports back — see **section 4**.
 
+**Live link signal (SIGNAL card).** The C3 prints `[rx] link rssi=<dBm> ch=<n>
+sta=<0|1>` about once a second — `WiFi.RSSI()` of the S3's AP, which is the same
+S3 and the same channel the ESP-NOW video crosses — and the host parses it into a
+SIGNAL card (green > −60 dBm, amber > −75, red below; `–` = no report). It is
+flushed **between frames only**, so it never corrupts the JPEG stream. This is
+what the radio actually exposes: per-datagram RSSI is not available on this
+Arduino core (its `esp_now_recv_cb_t` has no `rx_ctrl`), and receiver **gain**
+(AGC/LNA) is not software-readable at all. TX power is (`WiFi.getTxPower()` /
+`setTxPower()`), and the S3's mic gain is compile-time ×8. Tune the report rate
+with `LINK_REPORT_PERIOD_MS` / `LINK_REPORT_MIN_DELTA` in
+`receiver/src/receiver_config.h` — the C3 firmware must be re-flashed for the
+card to show anything.
+
 > Tune the ESP‑NOW link with the dish: point the high‑gain element at the S3's
 > antenna. Range, orientation and the 2.4 GHz environment dominate throughput.
 
@@ -143,7 +158,9 @@ reports back — see **section 4**.
 |---------|-------------|
 | `pio device monitor` shows **nothing at all** | TinyUSB drops all bytes until the host asserts DTR. Open the monitor first, **then press the C3's reset button** — the firmware re-greets whenever a monitor attaches, so you can also just re-open the monitor. |
 | Monitor works, but the host script shows 0 frames | Only one program can hold the port. Close the monitor, then run `python3 c3_usb_mjpeg.py` (it asserts DTR/RTS and sends `g` itself). Check the page's status line (`frames=/skips=`) — nonzero `skips` means data was arriving before the parser synced. |
-| Several boards share one machine (`/dev/ttyACM0`, `ACM1`, ...) | The script now *probes* each port and reports `C3 identified on <port>`; pass `--port /dev/ttyACMx` to pin it. If it says "no C3-style answer", the C3 was still joining Wi-Fi or is the wrong board. |
+| Several boards share one machine (`/dev/ttyACM0`, `ACM1`, ...) | The script *probes* each port and reports `C3 identified on <port>`; pass `--port /dev/ttyACMx` to pin it. "no answer to the C3 probe" means that board is not the C3 firmware (or the C3 is still joining Wi-Fi and only printing `.` dots). |
+| Stream dies after an unplug / C3 reboot / cable glitch and never returns | **Fixed (2026-10-16).** The reader thread used to die on the first failed reopen (`os.read(None)` → `TypeError` inside `finally: os.close(None)`), so only restarting the script brought the stream back. It now reconnects forever: reopen on read error, re-detect a renamed node (`ttyACM0` → `ACM1`), cycle an open-but-silent fd every 20 s (that is the only thing that clears a wedged host-side CDC endpoint), and name the PID holding a locked port. The header shows `⟳ reconnecting…` with the reconnect count until frames return. Regression test, no hardware needed: `python3 host/test_reader_recovery.py`. |
+| **Picture freezes and stays frozen even though the C3 is fine** (console pane keeps printing `[rx] frame N ok …`, `/status` `frames` stuck) | **Fixed (2026-10-16).** The C3 drops to CONSOLE mode on any stray `x` — a second host instance, a `pio device monitor` exit, its own USB glitch — and needs a new `g` to stream again; the host's re-arm was gated on the *cumulative* frame counter, so after the first frame it never sent `g` again. Now the re-arm fires every ~2 s whenever no frame is being decoded (suppressed while PAUSEd), and the page re-opens `/stream` if `seq` stalls for 4 s. Verify with `python3 host/test_reader_recovery.py` (test [9]). |
 | Host console shows `[c3] streaming, but NO ESP-NOW frames yet ...` | The C3's USB link is fine but nothing is arriving over the air. On the S3: check `ESPNOW_PEER_MAC` in `src/config.h` matches this C3's MAC (type `m` in the C3 monitor), and check the S3 for brownout. |
 | `Resource busy` / port grabbed | A desktop service (ModemManager, brltty) may claim `/dev/ttyACM0` when it appears. Stop it (`sudo systemctl stop ModemManager`) or add a udev rule, then re-run. |
 | Status shows `skips` growing but `frames=0` | Real framing loss: the C3 is forwarding but the host never gets a whole frame — slow host or the sender keeps tearing frames (see the row above). Console text (banner/hints) is **not** counted as skips any more, so a large `skips` means genuine binary loss. |
@@ -313,6 +330,8 @@ itself** once that many seconds have elapsed.
 | `USB_MAGIC_HI/LO`, `USB_HEADER_BYTES`, `USB_BAUD` | `receiver/src/receiver_config.h` **+** `host/c3_usb_mjpeg.py` | USB CDC framing (keep in sync) |
 | `REC_STATUS_TAG`, `REC_CTRL_TAG_R/T/P` | `src/config.h` **+** `receiver/src/receiver_config.h` | Recording control/status datagrams (keep in sync) |
 | `[rx] REC state=…` line format | `receiver/src/receiver.cpp` **+** `host/c3_usb_mjpeg.py` (`REC_LINE_RE`) | Recording status the dashboard parses (keep in sync) |
+| `[rx] link rssi=… ch=… sta=…` line format | `receiver/src/receiver.cpp` (`reportLink`) **+** `host/c3_usb_mjpeg.py` (`LINK_LINE_RE`) | Live link level for the SIGNAL card (keep in sync) |
+| `LINK_REPORT_PERIOD_MS` / `LINK_REPORT_MIN_DELTA` | `receiver/src/receiver_config.h` | How often / how eagerly the C3 reports RSSI |
 
 ## 7) Notes & limitations
 

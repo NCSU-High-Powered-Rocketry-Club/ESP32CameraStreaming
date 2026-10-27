@@ -130,15 +130,28 @@ static uint32_t crc32(const uint8_t* data, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// Recording-status lines from the S3. onRecv() runs in the WiFi task, and
-// writing console text to USB from there could land INSIDE a half-delivered
-// JPEG frame and corrupt the host's stream. So onRecv only queues the line and
-// loop() flushes it once the USB pump is idle (outState == 0) - the same
-// guarantee the pump itself relies on. The hardware UART gets it immediately.
+// Console lines queued for the USB host (recording status from the S3, live
+// link/RSSI reports). onRecv() runs in the WiFi task, so the ring is guarded by
+// a critical section; loop() is the only consumer and flushes a line only while
+// the USB pump is BETWEEN frames (outState == 0) - console text can therefore
+// never land inside a half-delivered JPEG.
 // ---------------------------------------------------------------------------
-static char             recLineBuf[128];
-static volatile bool    recLinePending = false;
-static portMUX_TYPE     recLineMux = portMUX_INITIALIZER_UNLOCKED;
+#define USB_LINE_SLOTS 4
+#define USB_LINE_LEN   160
+static char             usbLineBuf[USB_LINE_SLOTS][USB_LINE_LEN];
+static volatile uint8_t usbLineHead = 0, usbLineTail = 0;
+static portMUX_TYPE     usbLineMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void queueUsbLine(const char* line) {
+  portENTER_CRITICAL(&usbLineMux);
+  uint8_t next = (uint8_t)((usbLineHead + 1) % USB_LINE_SLOTS);
+  if (next != usbLineTail) {          // ring full -> drop (another follows soon)
+    strncpy(usbLineBuf[usbLineHead], line, USB_LINE_LEN - 1);
+    usbLineBuf[usbLineHead][USB_LINE_LEN - 1] = '\0';
+    usbLineHead = next;
+  }
+  portEXIT_CRITICAL(&usbLineMux);
+}
 
 void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
   // Recording status from the S3 ({'S', on, sd, prio, frames(2BE), left(2BE),
@@ -160,12 +173,7 @@ void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
              on ? "on" : "off", (unsigned)idx, (unsigned)frames, leftTxt,
              (char)data[3], (unsigned)(sd ? 1 : 0));
     Serial0.print(line);                  // hw UART: immediately, always
-    if (!recLinePending) {                // queue exactly one for the USB host
-      portENTER_CRITICAL(&recLineMux);
-      memcpy(recLineBuf, line, sizeof(recLineBuf));
-      recLinePending = true;
-      portEXIT_CRITICAL(&recLineMux);
-    }
+    queueUsbLine(line);                   // USB host: flushed between frames
     return;
   }
 
@@ -406,27 +414,57 @@ static int readDecArg(int maxDigits) {
   return v;
 }
 
-// Flush a queued "[rx] REC ..." line to the USB host. In console mode it goes
-// out immediately; in stream mode it waits until the pump is BETWEEN frames
+// Flush one queued console line to the USB host. In console mode it goes out
+// immediately; in stream mode it waits until the pump is BETWEEN frames
 // (outState == 0) so console text can never land inside a JPEG delivery - the
 // host's parser would resync anyway, but there is no reason to inject noise.
-// If the host's write buffer is full the line is dropped: another status
-// report follows within RECORD_STATUS_PERIOD_MS (2 s on the sender).
-static void flushRecStatusLine() {
-  if (!recLinePending) return;
-  if (usbStreaming && outState != 0) return;
+// If the host's write buffer is full the line stays queued and is retried next
+// pass; if the ring overflows, a status line is dropped (another follows within
+// LINK_REPORT_PERIOD_MS / RECORD_STATUS_PERIOD_MS).
+static void flushUsbLine() {
+  if (usbLineTail == usbLineHead) return;        // nothing queued
+  if (usbStreaming && outState != 0) return;     // never split a frame
+  if (!Serial) return;                           // no USB host attached
 
-  char buf[sizeof(recLineBuf)];
-  portENTER_CRITICAL(&recLineMux);
-  memcpy(buf, recLineBuf, sizeof(buf));
-  recLinePending = false;
-  portEXIT_CRITICAL(&recLineMux);
+  char buf[USB_LINE_LEN];
+  portENTER_CRITICAL(&usbLineMux);
+  memcpy(buf, usbLineBuf[usbLineTail], sizeof(buf));   // peek (producers only
+  portEXIT_CRITICAL(&usbLineMux);                      //  ever write at head)
   buf[sizeof(buf) - 1] = '\0';
 
-  if (!Serial) return;                                  // no USB host attached
   size_t len = strlen(buf);
-  if ((size_t)Serial.availableForWrite() < len) return;  // host busy - skip
+  if ((size_t)Serial.availableForWrite() < len) return;  // host busy - retry
   Serial.print(buf);
+
+  portENTER_CRITICAL(&usbLineMux);
+  if (usbLineTail != usbLineHead)
+    usbLineTail = (uint8_t)((usbLineTail + 1) % USB_LINE_SLOTS);
+  portEXIT_CRITICAL(&usbLineMux);
+}
+
+// Live link level. The C3 receives the ESP-NOW video on the channel of its AP
+// connection, so WiFi.RSSI() is the level of the link the video actually uses.
+// Reported ~1 Hz, and sooner when the level moves by LINK_REPORT_MIN_DELTA dBm
+// (so a fading link is visible immediately instead of up to a second late).
+static void reportLink() {
+  static uint32_t lastMs = 0;
+  static int      lastRssi = 0;
+  static bool     haveLast = false;
+  uint32_t now = millis();
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  int rssi = connected ? (int)WiFi.RSSI() : 0;
+  bool moved = !haveLast || abs(rssi - lastRssi) >= LINK_REPORT_MIN_DELTA;
+  if (now - lastMs < LINK_REPORT_PERIOD_MS && !(moved && now - lastMs >= 250))
+    return;
+  lastMs = now;
+  lastRssi = rssi;
+  haveLast = true;
+
+  char line[64];
+  snprintf(line, sizeof(line), "[rx] link rssi=%d ch=%u sta=%u\n",
+           rssi, (unsigned)WiFi.channel(), connected ? 1u : 0u);
+  Serial0.print(line);
+  queueUsbLine(line);
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +487,33 @@ static void handleCommand(char ch) {
     char label[32];
     snprintf(label, sizeof(label), "quality %c", ch);
     relayToSender(cmd, sizeof(cmd), label);
+  } else if (ch == 'F') {
+    // Dashboard "fps" mode: the sender drops the mic and pins quality at LOW so
+    // the freed airtime goes to frame rate. Idempotent SET -> relayed 3x.
+    int lv = readDecArg(1);
+    if (lv != 0 && lv != 1) {
+      Serial0.println("[rx] usage: F0 / F1   (fps priority off / on)");
+      if (!usbStreaming) Serial.println("[rx] usage: F0 / F1");
+    } else {
+      uint8_t cmd[2] = { (uint8_t)FPS_CTRL_TAG_F, (uint8_t)('0' + lv) };
+      relayToSender(cmd, sizeof(cmd), lv ? "fps priority ON" : "fps priority OFF");
+    }
+  } else if (ch == 'V' || ch == 'v') {
+    // Dashboard frame-rate cap: an absolute limit, 1..60 fps, on the sender.
+    int fps = readDecArg(2);
+    if (fps < 1 || fps > 60) {
+      Serial0.println("[rx] usage: V<1..60>   (fps cap)");
+      if (!usbStreaming) Serial.println("[rx] usage: V<1..60>");
+    } else {
+      uint8_t cmd[2] = { (uint8_t)FPS_CTRL_TAG_V, (uint8_t)fps };
+      char label[32];
+      snprintf(label, sizeof(label), "fps cap %d", fps);
+      relayToSender(cmd, sizeof(cmd), label);
+    }
+  } else if (ch == 'A') {
+    // Dashboard AUTO: hand quality AND rate back to the adaptive controller.
+    uint8_t cmd = (uint8_t)QUAL_CTRL_TAG_A;
+    relayToSender(&cmd, 1, "quality AUTO");
   } else if (ch == 'r' || ch == 'e') {
     // Dashboard: start ('r') / stop ('e') the microSD recording on the S3.
     uint8_t cmd[2] = { (uint8_t)REC_CTRL_TAG_R, (uint8_t)(ch == 'r' ? '1' : '0') };
@@ -532,7 +597,7 @@ static void consoleHello() {
   const char* line1 = "\n[rx] ESP32-C3 dish receiver | WiFi '%s' | MAC %02X:%02X:%02X:%02X:%02X:%02X\n";
   const char* line2 = "[rx] console: m = MAC, s = status, g = start USB stream, x = stop\n"
                       "[rx] ctrl: 0/1/2 quality, r/e rec start/stop, t<secs> max length, "
-                      "p<0..2> priority, M mic\n";
+                      "p<0..2> priority, M mic, F0/F1 fps mode, V<1..60> fps cap, A auto\n";
   Serial0.printf(line1, WIFI_SSID, d[0],d[1],d[2],d[3],d[4],d[5]);
   Serial0.print(line2);
   Serial.printf(line1, WIFI_SSID, d[0],d[1],d[2],d[3],d[4],d[5]);  // no-op if no host
@@ -637,7 +702,8 @@ void loop() {
 
   pumpUsb();
   pumpUsbAudio();
-  flushRecStatusLine();
+  flushUsbLine();          // queued REC / link lines, between frames
+  reportLink();            // live RSSI -> "[rx] link rssi=... " (host SIGNAL card)
   handleSerialInput();
 
   // Streaming but the air side is silent? Tell the user where to look. Safe

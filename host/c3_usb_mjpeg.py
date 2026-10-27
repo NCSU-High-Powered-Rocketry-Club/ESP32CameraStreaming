@@ -35,6 +35,21 @@ the `m`/`s` commands work from `pio device monitor`). This script sends `g`
 right after opening the port to switch the C3 into **stream mode** (binary
 frames), and sends `x` on exit to hand the console back.
 
+Recovery (why this script no longer needs restarting): the serial reader thread
+reconnects forever instead of exiting.
+  * read error (unplug, C3 reboot, USB re-enumeration) -> close the fd,
+    reconnect;
+  * device node gone/renamed (ttyACM0 -> ttyACM1) -> rescan and adopt the port
+    that answers the C3 probe (`pass --port` to pin one);
+  * port open but zero bytes for USB_SILENCE_CYCLE_S -> cycle the fd, which is
+    the only thing that clears a wedged host-side CDC endpoint;
+  * port held by a stale instance -> the 'port is locked' message names the
+    holding pid;
+  * a deliberate PAUSE (`x` from the dashboard) is respected: the keep-alive
+    'g' and the silence cycle are both skipped while paused.
+The dashboard header shows `⟳ reconnecting…` (with the reconnect count) while
+the reader is between connections.
+
 Dashboard controls (HTTP `/ctl?cmd=...` -> the C3's serial console -> ESP-NOW
 broadcast -> the S3 sender). Single chars are written to the C3 as-is:
     g / x        start / pause the USB frame stream
@@ -46,6 +61,13 @@ broadcast -> the S3 sender). Single chars are written to the C3 as-is:
 The sender reports its recording state back over ESP-NOW; the C3 prints it as an
 `[rx] REC state=... idx=... frames=... left=... prio=... sd=...` line, which
 this script shows in the console pane AND parses into the SD-recording card.
+
+Live link signal: the C3 also prints `[rx] link rssi=<dBm> ch=<n> sta=<0|1>`
+about once a second (WiFi.RSSI()/channel of the S3's AP - the same S3 and the
+same channel the ESP-NOW video crosses), which feeds the dashboard's SIGNAL
+card. The C3 can only report the AP-level figure: this Arduino core's
+`esp_now_recv_cb_t` carries no `rx_ctrl`, so per-datagram RSSI is not available
+(see receiver/src/receiver.cpp -> reportLink(), keep the format in sync).
 """
 import argparse
 import collections
@@ -69,6 +91,12 @@ HEADER = 12            # magic(2) + length(4) + frame id(2) + crc32(4)
 MAX_FRAME = 32 * 1024  # RECEIVER_MAX_FRAME_BYTES on the C3 (no PSRAM)
 AUDIO_RATE = 8000      # MIC_STREAM_RATE on the sender (Hz)
 BAUD_DEFAULT = 115200  # USB_BAUD / monitor_speed
+# Recovery timings (see SerialReader.run). A USB CDC port that was closed by an
+# unplug/replug, a C3 reboot or a wedged host endpoint can only be revived by
+# CLOSING and REOPENING the device - the reader therefore never gives up and
+# never lets a dead fd kill its thread ("sometimes I have to restart it").
+USB_RECONNECT_DELAY = 1.0    # s between port-open attempts
+USB_SILENCE_CYCLE_S = 20.0   # open but zero bytes for this long -> cycle port
 # Mirrors RECORD_MAX_SECONDS in src/config.h - only used to prefill the
 # dashboard's "max clip length" field so it matches the firmware default.
 REC_MAX_SECONDS_DEFAULT_TEXT = "30"
@@ -84,6 +112,13 @@ _BAUD_TERMIOS = {
 # parses it so the SD-recording card shows the REAL state of the sender.
 REC_LINE_RE = re.compile(
     r"\[rx\] REC state=(\w+) idx=(\d+) frames=(\d+) left=(\S+) prio=(\d) sd=(\d)")
+
+# Live link report from the C3 (receiver/src/receiver.cpp -> reportLink()):
+# WiFi.RSSI()/channel of the AP it is associated with, which is the same S3 and
+# the same channel the ESP-NOW video crosses. Keep in sync with the firmware.
+# (Per-DATAGRAM RSSI is not available: this Arduino core's esp_now_recv_cb_t
+# carries no rx_ctrl, so the AP-level figure is what the C3 can report.)
+LINK_LINE_RE = re.compile(r"\[rx\] link rssi=(-?\d+) ch=(\d+) sta=(\d)")
 
 
 def _candidate_ports(port=None):
@@ -101,6 +136,43 @@ def _candidate_ports(port=None):
             seen.add(p)
             ordered.append(p)
     return ordered
+
+
+def _port_holder(port):
+    """Best-effort (pid, cmdline) of the process holding `port` open.
+
+    Only /proc is used (no pyserial, no lsof). Used to turn the 'port is
+    locked' failure into an actionable message: a stale c3_usb_mjpeg.py from a
+    previous run keeps both the tty AND (via flock) the port, and that is the
+    usual reason a fresh run "needs a restart" to work.
+    """
+    try:
+        real = os.path.realpath(port)
+    except OSError:
+        real = port
+    me = os.getpid()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        if int(pid) == me:
+            continue
+        try:
+            fds = os.listdir("/proc/%s/fd" % pid)
+        except OSError:
+            continue
+        for f in fds:
+            try:
+                if os.readlink("/proc/%s/fd/%s" % (pid, f)) != real:
+                    continue
+                with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                    cmd = fh.read().replace(b"\0", b" ").decode("utf-8",
+                                                                "replace")
+            except OSError:
+                continue
+            return int(pid), (cmd.strip() or "?")
+    return None
 
 
 def open_serial(port, baud):
@@ -138,13 +210,24 @@ def open_serial(port, baud):
             fcntl.ioctl(fd, termios.TIOCMBIS,
                         struct.pack("I", termios.TIOCM_DTR | termios.TIOCM_RTS))
         except BlockingIOError:
+            # Already closed here, so clear the fd: the outer handler must not
+            # close it a second time - double-closing raised OSError(EBADF),
+            # which REPLACED this RuntimeError and made a held port look like
+            # the useless "[Errno 9] Bad file descriptor (skipping)".
             os.close(fd)
-            raise RuntimeError("port is locked - another c3_usb_mjpeg.py "
-                               "instance is probably still running")
+            fd = -1
+            who = _port_holder(port)
+            detail = (" (held by pid %d: %s)" % who) if who else ""
+            raise RuntimeError("port is locked%s - another c3_usb_mjpeg.py "
+                               "or a serial monitor is holding it" % detail)
         except Exception:
             pass
     except Exception:
-        os.close(fd)
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         raise
     return fd
 
@@ -268,6 +351,11 @@ class StreamState:
         self.log = []
         self.port = "?"
         self.reader = None   # SerialReader once attached (used by /ctl)
+        # Serial link health: set by SerialReader. `reader_open=False` means we
+        # are between reconnects (unplugged / re-enumerating / locked port) -
+        # the dashboard shows that instead of silently looking "dead".
+        self.reader_open = False
+        self.reconnects = 0
         # Rolling per-frame metrics window (host-measured, last ~10 s).
         self.win = collections.deque(maxlen=600)   # (ts, payload_len)
         self.skip_events = collections.deque(maxlen=2000)  # ts of each resync
@@ -275,6 +363,7 @@ class StreamState:
         self.audio = collections.deque(maxlen=600)  # ~ 600*240B ≈ 18 s max
         self.audio_pkts = 0
         self.paused = False   # set by /ctl 'x' / 'g' - distinguishes pause vs dead
+        self.pause_ts = 0.0   # when PAUSE was requested (grace for in-flight frames)
         # SD recording on the SENDER, as reported by the C3's "[rx] REC ..."
         # lines (the S3 -> C3 leg is one-way ESP-NOW, so this is the only
         # feedback path). None = nothing heard yet.
@@ -283,6 +372,16 @@ class StreamState:
         # What the dashboard last ASKED for (the S3 does not echo settings back
         # separately): shown next to the buttons so it is clear what was sent.
         self.rec_set = {"seconds": REC_MAX_SECONDS_DEFAULT_TEXT, "prio": None}
+        # fps-priority mode / frame-rate cap / manual-quality as last requested
+        # by the dashboard (the S3 does not echo settings back - same convention
+        # as rec_set). None = never asked.
+        self.fps_set = None
+        self.fps_target = None
+        self.quality_manual = False
+        # Live link level from the C3's "[rx] link rssi=..." lines (see
+        # LINK_LINE_RE). None = nothing heard yet.
+        self.link = None            # dict(rssi, ch, sta)
+        self.link_ts = 0.0
 
     # ESP-NOW air-latency estimate: ~4 ms per 250-byte datagram (send + link
     # ACK + turnaround), plus ~40 ms capture/assemble/USB overhead. A rough
@@ -299,6 +398,14 @@ class StreamState:
             self._seq += 1
             self.frames += 1
             self.last_frame_ts = time.time()
+            # Frames are arriving again, so any earlier 'x' (PAUSE button, or a
+            # previous crashed instance's exit handler) is not in effect any
+            # more - otherwise the header would claim "paused" forever. Brief
+            # grace window: bytes already queued on the USB side when PAUSE was
+            # pressed still decode as one or two frames, and those must not
+            # cancel a pause that DID take effect on the C3.
+            if self.paused and time.time() - self.pause_ts > 2.0:
+                self.paused = False
             self.win.append((self.last_frame_ts, len(payload), fid))
 
     def snapshot(self):
@@ -340,6 +447,25 @@ class StreamState:
             rec = dict(self.rec) if self.rec else None
             age = (time.time() - self.rec_ts) if self.rec_ts else -1.0
         return rec, age
+
+    def set_link(self, line):
+        """Parse a C3 '[rx] link rssi=... ' line. Returns True when it matched
+        (the line is logged either way)."""
+        m = LINK_LINE_RE.search(line)
+        if not m:
+            return False
+        rssi, ch, sta = m.groups()
+        with self._lock:
+            self.link = {"rssi": int(rssi), "ch": int(ch), "sta": sta == "1"}
+            self.link_ts = time.time()
+        return True
+
+    def link_snapshot(self):
+        """(link dict or None, seconds since the last report)."""
+        with self._lock:
+            link = dict(self.link) if self.link else None
+            age = (time.time() - self.link_ts) if self.link_ts else -1.0
+        return link, age
 
 
 class AudioDenoise:
@@ -409,7 +535,21 @@ class AudioDenoise:
 
 class SerialReader(threading.Thread):
     """Reads bytes from the C3's USB CDC port and funnels valid frames to
-    `state`. Exits when the port disappears or the user stops the program."""
+    `state`.
+
+    This thread NEVER exits on its own (only on KeyboardInterrupt). A vanished
+    device node, a failed reopen, a wedged endpoint or a port held by a stale
+    instance all just return it to the connect loop, so the viewer recovers by
+    itself instead of needing the script to be restarted:
+      * read error (unplug / re-enumeration / C3 reboot) -> close the fd and
+        reconnect;
+      * device node gone or renamed (ttyACM0 -> ttyACM1) -> rescan and adopt the
+        port that answers like a C3;
+      * port open but completely silent for USB_SILENCE_CYCLE_S -> cycle the fd
+        (a wedged host-side CDC endpoint only clears on close/reopen);
+      * every write to the fd goes through _write(), which swallows OSError and
+        the fd-is-None case - a control write must never kill the thread.
+    """
 
     def __init__(self, port, baud, state, noise_gate=10.0):
         super().__init__(daemon=True)
@@ -418,68 +558,172 @@ class SerialReader(threading.Thread):
         self.state = state
         self._fd = None          # set once the port is open (used by /ctl)
         self.denoise = AudioDenoise(noise_gate=noise_gate)
+        self._last_frame_ok = 0.0
+        self._last_g = 0.0
+        self._a_seq = None
+        self._connected_once = False
+        self._stopping = False    # set by stop() (main thread, Ctrl-C)
 
-    def send_command(self, chars):
-        """Write control chars ('g','x','0'..'2', ...) to the C3. Called from
-        the HTTP handler thread."""
+    # --- port access --------------------------------------------------------
+    def _write(self, data):
+        """Write to the C3 if a live fd exists; never raises.
+
+        Every 'g'/'x'/'m' write goes through here. With the old direct
+        os.write() calls a single fd-is-None or OSError between reconnects
+        raised out of run() and killed the reader thread - the stream then
+        stayed dead until the whole script was restarted.
+        """
         fd = self._fd
         if fd is None:
             return False
         try:
-            os.write(fd, chars.encode())
+            os.write(fd, data)
             termios.tcdrain(fd)
             return True
-        except (OSError, TypeError):
+        except (OSError, TypeError, ValueError):
             return False
 
+    def send_command(self, chars):
+        """Write control chars ('g','x','0'..'2', ...) to the C3. Called from
+        the HTTP handler thread."""
+        if isinstance(chars, str):
+            chars = chars.encode()
+        return self._write(chars)
+
+    def _try_open(self):
+        """One attempt at getting a live fd on the C3 (or None).
+
+        Tries the known port first; when that device node is GONE (USB
+        re-enumeration gives the C3 a new /dev/ttyACM* number) - or when no
+        port is known yet - it rescans and adopts the first port that answers
+        the C3 probe.
+        """
+        if self.port:
+            try:
+                return open_serial(self.port, self.baud)
+            except FileNotFoundError:
+                pass                      # node vanished - re-detect below
+            except Exception as exc:
+                self._log_once("open", "[serial] %s: %s" % (self.port, exc))
+                return None
+        for cand in _candidate_ports(None):
+            if cand == self.port:
+                continue
+            try:
+                fd = open_serial(cand, self.baud)
+            except Exception:
+                continue
+            if _probe_is_c3(fd):
+                print("[serial] C3 re-detected on %s (was %s)"
+                      % (cand, self.port), flush=True)
+                self.port = cand
+                return fd
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._log_once(
+            "none",
+            "[serial] no C3 found on any candidate port (is it plugged in?)"
+            if not self.port else
+            "[serial] %s is gone and no other port answers like a C3"
+            % self.port)
+        return None
+
+    def _log_once(self, key, msg):
+        """Rate-limit a repeated connect-loop message (~every 15 s)."""
+        last = getattr(self, "_log_key", None)
+        if last != key or time.time() - getattr(self, "_log_ts", 0) > 15.0:
+            self._log_key = key
+            self._log_ts = time.time()
+            print(msg, flush=True)
+
+    def stop(self):
+        """Ctrl-C path: hand the port back to the C3's console ('x') and let
+        the loop end. Without this the 'x' documented above never actually
+        reached the C3 - the process just exited and the fd was closed."""
+        self._stopping = True
+        self._write(b"x")
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     def run(self):
-        try:
-            parser = FrameParser()
-            fd = open_serial(self.port, self.baud)
-        except Exception as exc:
-            print(f"[serial] cannot open {self.port}: {exc}", flush=True)
-            self.state.errors += 1
-            return
-        self.state.port = self.port
-        self._fd = fd
-        print(f"[serial] opened {self.port} @ {self.baud} baud (raw 8N1)",
-              flush=True)
+        parser = FrameParser()
+        fd = None
         last_stall_warn = 0.0
         stream_started = False
-        open_ts = time.time()
+        open_ts = 0.0
+        got = 0                 # frames decoded in THIS loop pass
+        # Progress marker for the "open but silent" port cycle.
+        prog = (-1, -1)
+        prog_ts = 0.0
         try:
             while True:
+                if self._stopping:
+                    break
+                # ---- connect / reconnect (never gives up) -------------------
+                if fd is None:
+                    fd = self._try_open()
+                    if fd is None:
+                        self.state.reader_open = False
+                        time.sleep(USB_RECONNECT_DELAY)
+                        continue
+                    self._fd = fd
+                    # A fresh connection must not resync against the dead
+                    # link's leftover buffer.
+                    parser = FrameParser()
+                    self._a_seq = None
+                    stream_started = False
+                    open_ts = time.time()
+                    prog = (-1, -1)
+                    prog_ts = time.time()
+                    self.state.port = self.port
+                    self.state.reader_open = True
+                    if self._connected_once:
+                        self.state.reconnects += 1
+                        print(f"[serial] reopened {self.port}", flush=True)
+                    else:
+                        self._connected_once = True
+                        print(f"[serial] opened {self.port} @ {self.baud} baud "
+                              f"(raw 8N1)", flush=True)
+
                 try:
                     chunk = os.read(fd, 65536)
                 except OSError as exc:
+                    if self._stopping:
+                        break          # stop() closed the fd under us
                     # USB re-enumerated (C3 reboot / cable glitch): the fd is
-                    # dead. Close it and keep trying to reopen the same port -
-                    # this is what makes the stream self-recover after a drop
-                    # instead of needing a manual restart.
-                    print(f"[serial] read error: {exc} - reopening", flush=True)
+                    # dead. Close it and go back to the connect loop, which
+                    # retries forever - this is what makes the stream
+                    # self-recover after a drop instead of needing a restart.
+                    self._log_once(
+                        "read:%s" % exc,
+                        f"[serial] read error: {exc} - reopening")
                     self.state.errors += 1
+                    self.state.reader_open = False
+                    self._fd = None
                     try:
                         os.close(fd)
                     except OSError:
                         pass
                     fd = None
-                    self._fd = None
-                    time.sleep(1.0)
-                    try:
-                        fd = open_serial(self.port, self.baud)
-                        self._fd = fd
-                        stream_started = False
-                        open_ts = time.time()
-                        print(f"[serial] reopened {self.port}", flush=True)
-                    except Exception as exc2:
-                        print(f"[serial] reopen failed: {exc2}", flush=True)
+                    # Short backoff: a device node that is present but already
+                    # dead (the C3 re-enumerating) would otherwise be opened
+                    # and EIO'd in a tight loop.
+                    time.sleep(0.5)
                     continue
+                got = 0                      # frames decoded in THIS pass
                 if not chunk:
                     time.sleep(0.002)
                 else:
                     try:
                         for _fid, payload in parser.feed(chunk):
                             self.state.set_frame(payload, _fid)
+                            got += 1
                         if parser.audio_out:
                             now_a = time.time()
                             with self.state._lock:
@@ -526,6 +770,9 @@ class SerialReader(threading.Thread):
                             # "[rx] REC ..." lines carry the SENDER's recording
                             # state -> feed the dashboard's recording card.
                             self.state.set_rec(line)
+                            # "[rx] link rssi=... " lines carry the C3's live
+                            # link level -> the dashboard's SIGNAL card.
+                            self.state.set_link(line)
                     except Exception as exc:   # never let a bad chunk kill us
                         print(f"[serial] parse error: {exc}", flush=True)
                         self.state.errors += 1
@@ -535,59 +782,88 @@ class SerialReader(threading.Thread):
                 # proof of which board/port we are attached to.
                 if not stream_started and time.time() - open_ts >= 1.5:
                     stream_started = True
-                    os.write(fd, b"g")
-                    try:
-                        termios.tcdrain(fd)
-                    except Exception:
-                        pass
-                    last_frame_seen = time.time()
+                    self._write(b"g")
+                    self._last_g = time.time()
 
                 # Keep-alive: the C3 falls back to CONSOLE mode whenever its
                 # USB host re-enumerates (C3 reboot, cable glitch, S3 link
-                # loss causing a board reset...). It only re-enters stream
-                # mode when it sees 'g' again. Re-send 'g' periodically while
-                # no frame has been decoded for a while - it is harmless in
-                # stream mode (handleCommand just sets the same flag).
-                if parser.frames == 0 or \
-                        time.time() - getattr(self, "_last_frame_ok", 0) > 3.0:
-                    if time.time() - getattr(self, "_last_g", 0) > 2.0:
-                        self._last_frame_ok = getattr(self, "_last_frame_ok", 0)
-                        self._last_g = time.time()
-                        try:
-                            os.write(fd, b"g")
-                        except OSError:
-                            pass
-                if parser.frames:
+                # loss causing a board reset...), and any stray 'x' (another
+                # host instance, a monitor exit handler) puts it there too. It
+                # only re-enters stream mode when it sees 'g' again, so re-send
+                # 'g' every ~2 s while NO frame is being decoded.
+                # NOTE `got` (frames in THIS pass), not `parser.frames`: that
+                # counter is cumulative and non-zero forever after the first
+                # frame, which used to refresh _last_g on every pass and made
+                # this keep-alive dead once the stream had ever worked - a
+                # single stray 'x' then froze the picture until a manual
+                # restart. Verified live: with `parser.frames` the poke left
+                # frames frozen at 96 for 25+ s; with `got` it recovers in ~2 s.
+                if got:
                     self._last_frame_ok = time.time()
                     self._last_g = time.time()
+                elif time.time() - self._last_frame_ok > 3.0 and \
+                        time.time() - self._last_g > 2.0 and \
+                        not self.state.paused:
+                    self._last_g = time.time()
+                    self._write(b"g")
+
+                # Open but COMPLETELY silent (not one byte, not even console
+                # text): the host-side CDC endpoint or the C3's USB stack is
+                # wedged. resending 'g' cannot clear that - only closing and
+                # reopening the device does, which is exactly the manual
+                # restart this loop now does for you. Skipped while paused:
+                # a deliberate PAUSE is meant to be silent.
+                if self.state.paused:
+                    prog_ts = time.time()
+                elif (parser.frames, parser.bytes) != prog:
+                    prog = (parser.frames, parser.bytes)
+                    prog_ts = time.time()
+                elif time.time() - prog_ts > USB_SILENCE_CYCLE_S:
+                    print(f"[serial] no data for {USB_SILENCE_CYCLE_S:.0f}s on "
+                          f"{self.port} - cycling the USB port", flush=True)
+                    self.state.reader_open = False
+                    self._fd = None
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    fd = None
+                    continue
 
                 # Distinguish "no sender at all" from "bytes flowing but no
                 # complete frame" - the latter usually means the S3 stopped
-                # mid-stream (e.g. browned out) or the link is dropping.
+                # mid-stream (e.g. browned out) or the link is dropping. A C3
+                # that cannot see its S3's AP only prints the '.' WiFi-join
+                # dots from setup() and answers no serial command at all, so
+                # name that case too - it looks exactly like a dead host link.
                 now = time.time()
                 age = now - (self.state.last_frame_ts or now)
                 if parser.bytes > 0 and parser.frames == 0 and age > 10 \
                         and now - last_stall_warn > 10:
                     last_stall_warn = now
                     print(f"[serial] {parser.bytes} bytes seen but 0 valid "
-                          f"frames in {age:.0f}s - sender likely stopped "
-                          f"mid-stream (check the S3's power/serial log)",
-                          flush=True)
+                          f"frames in {age:.0f}s - the C3 is only printing "
+                          f"console text (WiFi-join '.' dots mean it is still "
+                          f"waiting for the S3's AP; check the S3's power), or "
+                          f"the sender stopped mid-stream", flush=True)
         except KeyboardInterrupt:
             pass
         finally:
             # Politely hand the USB port back to console mode (m/s in the
-            # pio monitor work again) before we close it.
+            # pio monitor work again) before we close it. stop() usually did
+            # this already; this covers the KeyboardInterrupt-in-this-thread
+            # case. fd can be None (between reconnects) - os.close(None) raises
+            # TypeError, which used to escape this finally.
+            self._stopping = True
             try:
-                os.write(fd, b"x")
-                termios.tcdrain(fd)
-            except Exception:
-                pass
-            try:
+                if fd is not None:
+                    self._write(b"x")
                 self._fd = None
-                os.close(fd)
-            except OSError:
+                if fd is not None:
+                    os.close(fd)
+            except (OSError, TypeError, ValueError):
                 pass
+            self.state.reader_open = False
 
 
 INDEX_HTML = """<!DOCTYPE html><html><head><meta charset='utf-8'>
@@ -639,6 +915,8 @@ font-size:12px' id='port'></span></h1>
     <div class='s'>air frames lost (frame-id gaps)</div></div>
   <div class='card'><div class='v' id='c_size'>–</div><div class='l'>AVG FRAME</div>
     <div class='s' id='c_tot'></div></div>
+  <div class='card'><div class='v' id='c_sig'>–</div><div class='l'>LINK SIGNAL (S3)</div>
+    <div class='s' id='c_chan'>RSSI of the C3↔S3 link (WiFi.RSSI on the C3)</div></div>
 </div>
 <h3>Controls</h3>
 <div class='grid'>
@@ -647,13 +925,30 @@ font-size:12px' id='port'></span></h1>
       <button onclick="ctl('0')">LOW</button>
       <button onclick="ctl('1')">MED</button>
       <button onclick="ctl('2')">HIGH*</button>
-    </div><div class='s'>*capped at MEDIUM on ESP-NOW</div></div>
+      <button onclick="ctl('A')">AUTO</button>
+    </div><div class='s'>*capped at MEDIUM on ESP-NOW. LOW/MED/HIGH pin the
+    choice (the adaptive up-stepper stops undoing it); AUTO hands quality back
+    to the adaptive controller.</div></div>
   <div class='card' style='text-align:center'><div class='l'>USB STREAM</div>
     <div style='display:flex;gap:8px;justify-content:center;margin-top:6px'>
       <button onclick="ctl('g')">▶ START</button>
       <button onclick="ctl('x')">⏸ PAUSE</button>
       <button onclick="ctl('M')">🎤 MIC</button>
     </div><div class='s' id='ctlmsg'></div></div>
+  <div class='card' style='text-align:center'><div class='l'>FPS PRIORITY</div>
+    <div style='display:flex;gap:8px;justify-content:center;margin-top:6px'>
+      <button onclick="fpsToggle()" id='fpsbtn'>⚡ FPS</button>
+    </div>
+    <div style='display:flex;gap:6px;justify-content:center;margin-top:6px'>
+      <input id='fpsval' type='number' min='1' max='60' value='15'
+             style='width:70px;background:var(--bg);color:var(--tx);
+                    border:1px solid var(--line);border-radius:6px;padding:5px 6px'>
+      <button onclick='setFps()'>SET FPS</button>
+    </div><div class='s'>fps mode: mic OFF + quality pinned LOW (until you pick a
+    quality yourself) + the up-stepper blocked, so the freed airtime goes to
+    frame rate instead of a VGA up-step. SET FPS is an absolute cap, 1-60;
+    above ~9 fps airtime is the wall, so 60 = "as fast as the link allows".
+    Needs the F0/F1 + V build on BOTH boards.</div></div>
 </div>
 <h3>SD recording on the sender (ESP-NOW build only)</h3>
 <p class='foot' style='margin:0 0 6px'>Records the SAME frames the dish receives onto
@@ -733,8 +1028,22 @@ function audioToggle(){
   }).catch(function(){aPlaying=false;
     document.getElementById('abtn').textContent='🔈 LISTEN';});
 }
+// Watchdog: a <img> MJPEG stream whose connection died (server restart, C3
+// reset, Wi-Fi blip) never re-establishes itself - the page would sit on the
+// last frame forever even after frames are flowing again. When /status says
+// nothing has arrived for a few seconds, reopen /stream until it does.
+var lastSeq=-1, staleTicks=0;
+function streamWatchdog(seq){
+  if(seq!==lastSeq){ lastSeq=seq; staleTicks=0; return; }
+  if(++staleTicks>=4){          // 4 s with no new frame -> reopen the stream
+    staleTicks=0;
+    var v=document.getElementById('v');
+    v.src='/stream?t='+Date.now();
+  }
+}
 setInterval(function(){
   fetch('/status',{cache:'no-store'}).then(function(r){return r.json()}).then(function(s){
+    streamWatchdog(s.seq);
     var live = s.last_age >= 0 && s.last_age < 3;
     var paused = !!s.paused;
     document.getElementById('dot').className = live?'ok':'';
@@ -753,7 +1062,23 @@ setInterval(function(){
         s.avg_frame ? (s.avg_frame/1024).toFixed(1)+' KB' : '–';
     document.getElementById('c_tot').textContent =
         'frames='+s.frames+' skips='+s.skips+' errs='+s.errors;
+    // --- live link signal (RSSI reported by the C3) -------------------------
+    var sg=document.getElementById('c_sig'), chan=document.getElementById('c_chan');
+    if(s.rssi==null || s.rssi_age>8){
+      sg.textContent='–'; sg.style.color='var(--dim)';
+      chan.textContent = s.rssi==null
+        ? 'no report yet (older C3 firmware?)'
+        : 'stale (no report for '+Math.round(s.rssi_age)+' s)';
+    } else {
+      sg.textContent = s.rssi+' dBm';
+      sg.style.color = !s.rssi_sta ? 'var(--dim)'
+        : (s.rssi>-60?'var(--ok)':(s.rssi>-75?'var(--warn)':'var(--bad)'));
+      chan.textContent = (s.rssi_sta?'C3 ↔ S3 link':'C3 not associated')+
+        ' · ch '+s.rssi_ch;
+    }
     document.getElementById('port').textContent = '@ '+s.port+
+        (s.reader==='open'?'':'  ⟳ reconnecting…'+
+         (s.reconnects?(' ('+s.reconnects+')'):''))+
         (paused?'  ⏸ paused (button)':'');
     // --- SD recording card (state REPORTED BY THE SENDER via the C3) --------
     var rs=document.getElementById('recstat');
@@ -777,12 +1102,29 @@ setInterval(function(){
     .then(function(t){ if(t) document.getElementById('lg').textContent = t; })
     .catch(function(){});
 },1000);
+var fpsOn=false;
+function setFps(){
+  var el=document.getElementById('fpsval');
+  var v=parseInt(el.value,10);
+  if(!(v>=1&&v<=60)){ alert('fps must be 1-60'); return; }
+  ctl('V'+v);
+}
+function fpsToggle(){
+  fpsOn=!fpsOn;
+  ctl(fpsOn?'F1':'F0');
+  var b=document.getElementById('fpsbtn');
+  if(b) b.textContent = fpsOn ? '⚡ FPS ON' : '⚡ FPS';
+}
 function ctl(c){
   var names={g:'START stream',x:'PAUSE stream',M:'toggle MIC',
              r:'START recording',e:'END recording',
+             'F0':'fps mode OFF','F1':'fps mode ON (mic off, LOW pinned)',
+             'A':'quality AUTO (adaptive)',
              '0':'quality LOW','1':'quality MED','2':'quality HIGH'};
   if(c.charAt(0)==='t') names[c]='recording ends after '+c.slice(1)+' s';
   if(c.charAt(0)==='p') names[c]='priority '+({0:'SD',1:'balanced',2:'stream'}[c.slice(1)]||'?');
+  if(c.charAt(0)==='V') names[c]='fps cap '+c.slice(1);
+  if(c.charAt(0)==='F') names[c]=(c==='F1')?'fps mode ON':'fps mode OFF';
   fetch('/ctl?cmd='+c,{cache:'no-store'}).then(function(r){return r.json()})
     .then(function(j){
       var m=document.getElementById('ctlmsg');
@@ -880,23 +1222,40 @@ class ViewerHandler(BaseHTTPRequestHandler):
             rec, rec_age = self.state.rec_snapshot()
             rec_on = "true" if (rec and rec["on"]) else "false"
             rec_sd = "true" if (rec and rec["sd"]) else "false"
+            # Live link level reported by the C3 (WiFi.RSSI() of the S3's AP).
+            link, link_age = self.state.link_snapshot()
             body = ('{"seq":%d,"frames":%d,"skips":%d,"errors":%d,'
                     '"bytes":%d,"text":%d,"last_age":%.1f,"port":"%s",'
+                    '"reader":"%s","reconnects":%d,'
                     '"fps":%.1f,"kbps":%.0f,"avg_frame":%d,'
                     '"est_air_ms":%.0f,"gap_med_ms":%.0f,"gap_p95_ms":%.0f,'
                     '"paused":%s,"drop_pct":%s,'
+                    '"rssi":%s,"rssi_ch":%d,"rssi_sta":%s,"rssi_age":%.1f,'
                     '"rec_on":%s,"rec_idx":%d,"rec_frames":%d,"rec_left":"%s",'
-                    '"rec_prio":%d,"rec_sd":%s,"rec_age":%.1f}'
+                    '"rec_prio":%d,"rec_sd":%s,"rec_age":%.1f,"fps_mode":%s,'
+                    '"fps_target":%s,"quality_manual":%s}'
                     % (st[1], st[2], st[3], st[4], st[5],
                        getattr(self.state, "text_bytes", 0), age,
-                       self.state.port, fps, kbps, avg_b, est_lat,
+                       self.state.port,
+                       "open" if self.state.reader_open else "waiting",
+                       self.state.reconnects,
+                       fps, kbps, avg_b, est_lat,
                        med, p95,
                        "true" if self.state.paused else "false",
                        "null" if drop_pct is None else "%.1f" % drop_pct,
+                       "null" if link is None else "%d" % link["rssi"],
+                       (link["ch"] if link else 0),
+                       "true" if (link and link["sta"]) else "false",
+                       link_age,
                        rec_on, (rec["idx"] if rec else 0),
                        (rec["frames"] if rec else 0),
                        (rec["left"] if rec else "-"),
-                       (rec["prio"] if rec else -1), rec_sd, rec_age)).encode()
+                       (rec["prio"] if rec else -1), rec_sd, rec_age,
+                       "null" if self.state.fps_set is None
+                       else "%d" % self.state.fps_set,
+                       "null" if self.state.fps_target is None
+                       else "%d" % self.state.fps_target,
+                       "true" if self.state.quality_manual else "false")).encode()
             self._send_headers("application/json", len(body))
             self.wfile.write(body)
         elif path == "/console":
@@ -923,8 +1282,13 @@ class ViewerHandler(BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             raw = unquote(qs.get("cmd", [""])[0]).strip()
             clean = ""
-            if re.fullmatch(r"[gx012Mre]", raw):        # single-char commands
+            if re.fullmatch(r"[gx012MreA]", raw):       # single-char commands
                 clean = raw
+            elif re.fullmatch(r"F[01]", raw):           # fps-priority mode
+                clean = raw
+            elif re.fullmatch(r"[Vv]\d{1,2}", raw):      # fps cap, validated
+                _n = int(raw[1:])
+                clean = ("V%d" % _n) if 1 <= _n <= 60 else ""
             elif re.fullmatch(r"t\d{1,5}", raw):        # max clip length
                 clean = raw
             elif re.fullmatch(r"p[0-2]", raw):          # SD/stream priority
@@ -937,12 +1301,26 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 self.state.paused = False     # START resumes the stream
             elif ok and clean == "x":
                 self.state.paused = True      # PAUSE is deliberate
+                self.state.pause_ts = time.time()
             elif ok and clean.startswith("t"):
                 # Remember what we asked for - the S3 does not echo settings
                 # back separately, and the page shows the requested value.
                 self.state.rec_set["seconds"] = clean[1:] or "0"
             elif ok and clean.startswith("p"):
                 self.state.rec_set["prio"] = clean[1:] or "?"
+            elif ok and clean in ("F0", "F1"):
+                # fps-priority mode as last requested (not echoed by the S3).
+                self.state.fps_set = 1 if clean == "F1" else 0
+                if clean == "F1":
+                    self.state.quality_manual = False   # F1 re-pins LOW itself
+            elif ok and clean.startswith("V"):
+                self.state.fps_target = int(clean[1:])
+                self.state.quality_manual = True        # explicit rate pins it
+            elif ok and clean == "A":
+                self.state.fps_target = None
+                self.state.quality_manual = False       # adaptive is back in charge
+            elif ok and clean in ("0", "1", "2"):
+                self.state.quality_manual = True        # explicit quality pins it
             body = b'{"ok":' + (b"true" if ok else b"false") + b"}"
             self._send_headers("application/json", len(body))
             self.wfile.write(body)
@@ -1088,23 +1466,39 @@ def main():
             reader = SerialReader(port, args.baud, state,
                                   noise_gate=args.noise_gate)
             break
-        print(f"[serial] {port}: no C3-style answer to 's' "
-              f"(another board? skipping)", flush=True)
+        print(f"[serial] {port}: no answer to the C3 probe (a C3 that is still "
+              f"joining the S3's AP prints only '.' dots and answers nothing)",
+              flush=True)
         os.close(fd)
 
     if reader is None:
         if fallback_port is None:
-            print("[serial] no usable C3 port found. Plug the C3 in over USB "
-                  "and try again (or pass --port).", file=sys.stderr)
-            return 1
-        print(f"[serial] no port answered like a C3; falling back to "
-              f"{fallback_port} (pass --port to override)", flush=True)
-        reader = SerialReader(fallback_port, args.baud, state,
-                              noise_gate=args.noise_gate)
+            # Nothing on USB right now. Keep running and keep looking: the
+            # reader retries forever, so the viewer works as soon as the C3 is
+            # plugged in (no script restart needed).
+            print("[serial] no serial port found yet - waiting for the C3 to "
+                  "appear (pass --port to pin it)", flush=True)
+            reader = SerialReader(args.port, args.baud, state,
+                                  noise_gate=args.noise_gate)
+        else:
+            print(f"[serial] no port answered like a C3; falling back to "
+                  f"{fallback_port} (pass --port to override)", flush=True)
+            reader = SerialReader(fallback_port, args.baud, state,
+                                  noise_gate=args.noise_gate)
 
     # Serve HTTP first so the status page is reachable even before frames flow.
     state.reader = reader            # enables the /ctl dashboard controls
-    httpd = ThreadingHTTPServer((args.host, args.http_port), ViewerHandler)
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.http_port), ViewerHandler)
+    except OSError as exc:
+        # A socket already bound to this port is almost always a leftover
+        # instance from a previous run - the classic "it only works after I
+        # restart everything". Say so plainly instead of printing a traceback.
+        print(f"[http] cannot bind port {args.http_port}: {exc}\n"
+              f"[http] another c3_usb_mjpeg.py is probably still running "
+              f"(find it with: ss -ltnp | grep {args.http_port}) - "
+              f"or pass --http-port N", file=sys.stderr, flush=True)
+        return 1
     print(f"[http] MJPEG server at http://{_lan_ip()}:{args.http_port}/ "
           f"(stream: /stream)", flush=True)
     try:
@@ -1113,6 +1507,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[stop] shutting down", flush=True)
     finally:
+        reader.stop()          # sends 'x' so the C3 returns to console mode
         httpd.shutdown()
         httpd.server_close()
     return 0

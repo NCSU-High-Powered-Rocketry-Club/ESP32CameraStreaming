@@ -27,6 +27,16 @@
 // Max time we keep assembling a frame before giving up (auto-skip stale).
 #define FRAME_ASSEMBLE_TIMEOUT_MS  200UL
 
+// --- Live link report (RSSI) --------------------------------------------------
+// The C3 is a STA of the S3's AP and sends/receives ESP-NOW on that channel, so
+// WiFi.RSSI() is the live level of the very link the video crosses. It is
+// printed as "[rx] link rssi=<dBm> ch=<n> sta=<0|1>" between frames (never
+// inside one) and parsed by host/c3_usb_mjpeg.py into the SIGNAL card.
+// NOTE: this core's esp_now_recv_cb_t has no rx_ctrl, so per-datagram RSSI is
+// not available here; the AP-level figure is what the PHY exposes.
+#define LINK_REPORT_PERIOD_MS   1000UL   // heartbeat report interval
+#define LINK_REPORT_MIN_DELTA   2        // report sooner when |ΔRSSI| >= this
+
 // ---------------------------------------------------------------------------
 // USB CDC output framing (wired link to the host viewer).
 // MUST stay in sync with host/c3_usb_mjpeg.py (the C constants mirror the
@@ -57,13 +67,17 @@
 // ---------------------------------------------------------------------------
 // Control / status tags (ESP-NOW, tiny tagged datagrams).
 // MUST stay in sync with src/config.h in the sender project (section 5b) and
-// with host/c3_usb_mjpeg.py (the 'R'/'T'/'P' dashboard buttons).
+// with host/c3_usb_mjpeg.py (the 'R'/'T'/'P'/'F' dashboard buttons).
 //
 //   C3 -> S3 (broadcast, idempotent "set" commands, sent a few times):
 //     {'Q', '0'..'2'}                 video quality
 //     {'R', '0'|'1'}                  stop / start the microSD recording
 //     {'T', secHi, secLo}             max recording seconds (0 = unlimited)
 //     {'P', '0'..'2'}                 recording/streaming priority
+//     {'F', '0'|'1'}                  fps-priority mode: mic OFF + quality
+//                                     pinned LOW on the sender (idempotent)
+//     {'V', fps}                      frame-rate cap 1..60 (idempotent)
+//     {'A'}                           quality/rate back to AUTO (idempotent)
 //     {'M'}                           toggle the sender's mic (NOT idempotent,
 //                                     so this one is sent exactly once)
 //   S3 -> C3 (to the peer MAC):
@@ -75,6 +89,12 @@
 #define REC_CTRL_TAG_R   'R'
 #define REC_CTRL_TAG_T   'T'
 #define REC_CTRL_TAG_P   'P'
+// fps-priority mode ('F1' on / 'F0' off). Idempotent, so it is re-sent with
+// the other "set" commands (unlike the mic toggle, which must never repeat).
+#define FPS_CTRL_TAG_F   'F'
+// Frame-rate cap ('V<char>') and AUTO ('A'). Both idempotent SETs.
+#define FPS_CTRL_TAG_V   'V'
+#define QUAL_CTRL_TAG_A  'A'
 
 // --- Audio (PDM mic stream from the sender) ----------------------------------
 // Air audio datagram: [0xA3 0xA5][seq:2BE] + PCM bytes (8 kHz unsigned 8-bit).

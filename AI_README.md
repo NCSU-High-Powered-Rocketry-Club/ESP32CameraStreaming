@@ -155,6 +155,21 @@ port (e.g. `/dev/ttyACM0`), parses/CRC-validates the framing, and re-serves an
 MJPEG stream at `http://<host>:8080/`. It resyncs by scanning for the magic so a
 frame dropped mid-stream is just logged + skipped.
 
+Its serial reader thread is intentionally immortal: a read error (unplug, C3
+reboot, re-enumeration) closes the fd and reconnects, a gone/renamed device node
+is re-detected with the `s` probe, and a port that is open but has delivered no
+byte for `USB_SILENCE_CYCLE_S` (20 s) is closed+reopened - the only thing that
+clears a wedged host-side CDC endpoint. Never restart the script for a link
+problem: it does that itself (regression test `host/test_reader_recovery.py`
+drives the real thread against a fake C3 on a pty, no hardware required). The
+`g` keep-alive is suppressed while the dashboard is PAUSEd, so PAUSE holds.
+
+The page's **SIGNAL card** shows the live link level: the C3 prints
+`[rx] link rssi=<dBm> ch=<n> sta=<0|1>` (WiFi.RSSI() of the S3's AP, i.e. the
+same S3 and channel the ESP-NOW video crosses), queued between frames like the
+REC lines, parsed by `LINK_LINE_RE` into `/status` (`rssi*`). Per-datagram RSSI
+and receiver gain are NOT obtainable on this core - see TMP_ISSUES #9.
+
 **Quality presets** (`camera_hal.cpp`): LOW=QVGA 320×240/jpegq35, MED=VGA
 640×480/jpegq20 (default), HIGH=UXGA 1600×1200/jpegq12. Runtime change: serial
 `q0/q1/q2` or page buttons. ESP-NOW path also has an adaptive quality controller.
